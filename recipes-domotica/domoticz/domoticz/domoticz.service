@@ -3,13 +3,18 @@ Description=domoticz_service
 After=basic.target
 
 [Service]
-Type=forking
-PIDFile=/var/lib/domoticz/domoticz.pid
-ExecStart=/var/lib/domoticz/domoticz -daemon -www 8080 -sslwww 8443 -syslog -pidfile /var/lib/domoticz/domoticz.pid
+Type=simple
+Environment="MALLOC_CHECK_=3"
+Environment="LIBC_FATAL_STDERR_=1"
+ExecStart=BINDIR/domoticz -www 8080 -sslwww 8443 -syslog -wwwcompress static -wwwroot /var/lib/domoticz/www/ -approot /var/lib/domoticz/
 WorkingDirectory=LIBDIR/domoticz/
 Restart=on-abort
+RestartSec=10
 User=domoticz
-StandardOutput=null
+#StandardOutput=null
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=tmpfs
 
 [Install]
 WantedBy=multi-user.target
