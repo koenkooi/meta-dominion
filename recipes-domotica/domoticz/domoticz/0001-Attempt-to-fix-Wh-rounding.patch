@@ -1,0 +1,29 @@
+From 07e918f32f607316f56272438dfc031a5a8844ad Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sat, 3 Jun 2017 15:01:50 +0200
+Subject: [PATCH] Attempt to fix Wh rounding
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ main/SQLHelper.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/main/SQLHelper.cpp b/main/SQLHelper.cpp
+index 9e6e405..1201b5e 100644
+--- a/main/SQLHelper.cpp
++++ b/main/SQLHelper.cpp
+@@ -3425,9 +3425,9 @@ uint64_t CSQLHelper::UpdateValueInt(const int HardwareID, const char* ID, const
+ 
+ 			interval = difftime(now,lutime);
+ 			StringSplit(result[0][5].c_str(), ";", parts);
+-			nEnergy = static_cast<float>(strtof(parts[0].c_str(), NULL)*interval / 3600 + strtof(parts[1].c_str(), NULL)); //Rob: whats happening here... strtof ?
++			nEnergy = static_cast<float>(strtof(parts[0].c_str(), NULL)*interval / 3600 + strtof(parts[1].c_str(), NULL)); //Rob: whats happening here... strtof ?
+ 			StringSplit(sValue, ";", parts);
+-			sprintf(sCompValue, "%s;%.0f", parts[0].c_str(), nEnergy);
++			sprintf(sCompValue, "%s;%.1f", parts[0].c_str(), nEnergy);
+ 			sValue = sCompValue;
+ 		}
+ 	        //~ use different update queries based on the device type
+-- 
+2.0.1
+
