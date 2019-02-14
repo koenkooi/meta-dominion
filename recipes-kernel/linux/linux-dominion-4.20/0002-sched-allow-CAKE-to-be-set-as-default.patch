@@ -1,0 +1,35 @@
+From 255638ff283bded790e3942b569e5be187c91bf2 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen.kooi@linaro.org>
+Date: Mon, 15 Oct 2018 10:12:54 +0200
+Subject: [PATCH 2/2] sched: allow CAKE to be set as default
+
+Signed-off-by: Koen Kooi <koen.kooi@linaro.org>
+---
+ net/sched/Kconfig | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index e957413..99eda6a 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -432,6 +432,9 @@ choice
+ 
+ 	config DEFAULT_PFIFO_FAST
+ 		bool "Priority FIFO Fast"
++
++	config DEFAULT_CAKE
++		bool "Common Applications Kept Enhanced"
+ endchoice
+ 
+ config DEFAULT_NET_SCH
+@@ -440,6 +443,7 @@ config DEFAULT_NET_SCH
+ 	default "fq" if DEFAULT_FQ
+ 	default "fq_codel" if DEFAULT_FQ_CODEL
+ 	default "sfq" if DEFAULT_SFQ
++	default "cake" if DEFAULT_CAKE
+ 	default "pfifo_fast"
+ endif
+ 
+-- 
+2.9.5
+
