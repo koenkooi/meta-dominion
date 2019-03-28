@@ -7,9 +7,9 @@ DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto"
 
 inherit cmake pkgconfig useradd systemd
 
-PV = "4.10547+git${SRCPV}"
+PV = "4.10577+git${SRCPV}"
 
-SRCREV = "a76a0fdb0580c8b1b554d277cecebf3bda1670e9"
+SRCREV = "9c9319ace1f0a76b12bf349d62f455a506d286df"
 SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
