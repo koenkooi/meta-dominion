@@ -7,9 +7,9 @@ DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto"
 
 inherit cmake pkgconfig useradd systemd
 
-PV = "4.10639+git${SRCPV}"
+PV = "4.10965+git${SRCPV}"
 
-SRCREV = "ae76889d72bd83870a29db3b473b53e297fd9a91"
+SRCREV = "3d378eab5950dc5decf482316c03a3a152926150"
 SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
@@ -35,6 +35,11 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                 "
 
 CXXFLAGS_append = " -std=c++11 -flto=jobserver"
+
+# Lower cmake version
+do_configure_prepend() {
+	sed -i -e s:3.14.0:3.10.0:g ${S}/CMakeLists.txt
+}
 
 do_install_append() {
     # The domoticz manual says "run from git checkout", but we don't tolerate such nonsense
