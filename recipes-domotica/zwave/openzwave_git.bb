@@ -36,4 +36,7 @@ do_install() {
 	oe_runmake install
 }
 
+PACKAGES =+ "libopenzwave"
+FILES_libopenzwave = "${libdir}/libopenzwave${SOLIBS}"
+
 FILES_${PN}-dev += "${bindir}/ozw_config"
