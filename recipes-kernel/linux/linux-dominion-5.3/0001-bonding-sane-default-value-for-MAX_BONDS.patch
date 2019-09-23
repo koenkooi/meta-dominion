@@ -1,0 +1,44 @@
+From 40226ced4f65b26107e538586a0834cee71aaa58 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Tue, 17 Jan 2017 08:00:32 +0100
+Subject: [PATCH 1/5] bonding: sane default value for MAX_BONDS
+
+This fixes many, many networking scripts.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ Documentation/networking/bonding.txt | 4 ++--
+ include/uapi/linux/if_bonding.h      | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/networking/bonding.txt b/Documentation/networking/bonding.txt
+index d3e5dd2..5bd8b36 100644
+--- a/Documentation/networking/bonding.txt
++++ b/Documentation/networking/bonding.txt
+@@ -512,8 +512,8 @@ max_bonds
+ 	Specifies the number of bonding devices to create for this
+ 	instance of the bonding driver.  E.g., if max_bonds is 3, and
+ 	the bonding driver is not already loaded, then bond0, bond1
+-	and bond2 will be created.  The default value is 1.  Specifying
+-	a value of 0 will load bonding, but will not create any devices.
++	and bond2 will be created.  The default value is 0.
++	A value of 0 will load bonding, but will not create any devices.
+ 
+ miimon
+ 
+diff --git a/include/uapi/linux/if_bonding.h b/include/uapi/linux/if_bonding.h
+index 790585f..8556092 100644
+--- a/include/uapi/linux/if_bonding.h
++++ b/include/uapi/linux/if_bonding.h
+@@ -82,7 +82,7 @@
+ #define BOND_STATE_ACTIVE       0   /* link is active */
+ #define BOND_STATE_BACKUP       1   /* link is backup */
+ 
+-#define BOND_DEFAULT_MAX_BONDS  1   /* Default maximum number of devices to support */
++#define BOND_DEFAULT_MAX_BONDS  0   /* Default maximum number of devices to support */
+ 
+ #define BOND_DEFAULT_TX_QUEUES 16   /* Default number of tx queues per device */
+ 
+-- 
+2.9.3
+
