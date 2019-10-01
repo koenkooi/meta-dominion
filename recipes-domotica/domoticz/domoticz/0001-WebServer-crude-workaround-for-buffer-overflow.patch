@@ -1,0 +1,30 @@
+From 255c3809d96f1ee36eaca52b4879fe9c66c7668b Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sat, 29 Sep 2018 15:52:16 +0200
+Subject: [PATCH] WebServer: crude workaround for buffer overflow
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ main/WebServer.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/main/WebServer.cpp b/main/WebServer.cpp
+index 4d38cf7..73db545 100644
+--- a/main/WebServer.cpp
++++ b/main/WebServer.cpp
+@@ -8951,6 +8951,12 @@ namespace http {
+ 							root["result"][ii]["LevelNames"] = base64_encode(levelNames);
+ 							root["result"][ii]["LevelActions"] = base64_encode(levelActions);
+ 						}
++
++						if (lstatus.size() > 50) {
++							_log.Log(LOG_STATUS, "Error found, lstatus is %s", lstatus.c_str());
++							lstatus = lstatus.substr(0,50);
++						}
++
+ 						sprintf(szData, "%s", lstatus.c_str());
+ 						root["result"][ii]["Data"] = szData;
+ 					}
+-- 
+2.0.1
+

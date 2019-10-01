@@ -7,41 +7,67 @@ DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto"
 
 inherit cmake pkgconfig useradd systemd
 
-PV = "3.9202+git${SRCPV}"
+PV = "4.10639+git${SRCPV}"
 
-SRCREV = "d58d55ab1dff3dc5a6c1cecd4691eb1ed374ceb3"
+SRCREV = "ae76889d72bd83870a29db3b473b53e297fd9a91"
 SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=development \
+           file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
           "
 
 S = "${WORKDIR}/git"
 
-EXTRA_OECMAKE = " -DBOOST_INCLUDEDIR=${STAGING_INCDIR} \
+EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
+                  -DWITH_GPIO=YES \
+                  -DBOOST_INCLUDEDIR=${STAGING_INCDIR} \
+                  -DUSE_STATIC_BOOST=NO \
                   -DOPENSSL_INCLUDE_DIR=${STAGING_INCDIR} \
                   -DOPENSSL_LIBRARIES=${STAGING_LIBDIR} \
+                  -DUSE_OPENSSL_STATIC=NO \
                   -DCURL_LIBRARIES=${STAGING_LIBDIR} \
                   -DCURL_INCLUDE_DIR=${STAGING_INCDIR} \
                   -DOPENZWAVE_LIBRARY_DIRS=${STAGING_LIBDIR} \
                   -DUSE_STATIC_OPENZWAVE=NO \
+                  -DUSE_STATIC_LIBSTDCXX=NO \
                   -DUSE_BUILTIN_MQTT=NO \
+                  -DUSE_BUILTIN_SQLITE=NO \
+                  -DUSE_BUILTIN_ZLIB=NO \
                 "
 
+CXXFLAGS_append = " -std=c++11 -flto=jobserver"
 
 do_install_append() {
     # The domoticz manual says "run from git checkout", but we don't tolerate such nonsense
     # and since 'make install' doesn't work properly, we do some massaging.
     install -d ${D}/foo
     mv ${D}${prefix}/* ${D}/foo
+
     install -d ${D}${localstatedir}/lib/domoticz
     mv ${D}/foo/* ${D}${localstatedir}/lib/domoticz
+
     rmdir ${D}/foo
+
+    # Webserver files, 'wwwroot'
+    install -d ${D}${datadir}/${BPN}
+    mv ${D}${localstatedir}/lib/domoticz/www ${D}${datadir}/${BPN}
+
+    # Data files and scripts, 'approot'
+    # keep them in /var/lib/domoticz
+
+    # Executables
+    install -d ${D}${bindir} 
+    mv ${D}${localstatedir}/lib/domoticz/domoticz ${D}${bindir}
+    # internal update script, disable
+    rm -f ${D}${localstatedir}/lib/domoticz/updatedomo
 
     chown -R domoticz ${D}${localstatedir}/lib
 
     install -d ${D}${systemd_unitdir}/system
-    sed s:LIBDIR:${localstatedir}/lib:g ${WORKDIR}/domoticz.service > ${D}${systemd_unitdir}/system/domoticz.service
-
-    rmdir ${D}${prefix}
+    sed -e s:LIBDIR:${localstatedir}/lib:g \
+        -e s:BINDIR:${bindir}:g \
+	-e s:/var/lib/domoticz/www:${datadir}/${BPN}/www:g \
+        -e s:/var:${localstatedir}:g \
+            ${WORKDIR}/domoticz.service > ${D}${systemd_unitdir}/system/domoticz.service
 }
 
 FILES_${PN}-dbg += "${localstatedir}/lib/domoticz/.debug/"
