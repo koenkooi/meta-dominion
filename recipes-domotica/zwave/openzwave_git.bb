@@ -2,7 +2,7 @@ SUMMARY = "A C++ library to control Z-Wave Networks via a USB Z-Wave Controller.
 HOMEPAGE = "http://www.openzwave.com/"
 
 LICENSE = "LGPLv3"
-LIC_FILES_CHKSUM = "file://license/lgpl.txt;md5=7be289db0a5cd2c8acf72a8cbd0c15df"
+LIC_FILES_CHKSUM = "file://licenses/lgpl.txt;md5=7be289db0a5cd2c8acf72a8cbd0c15df"
 
 inherit pkgconfig
 
