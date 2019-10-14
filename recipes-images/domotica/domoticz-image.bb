@@ -1,7 +1,7 @@
 #Angstrom image to test systemd
 
 LICENSE = "MIT"
-LIC_FILES_CHKSUM = "file://${COREBASE}/LICENSE;md5=4d92cd373abda3937c2bc47fbc49d690"
+LIC_FILES_CHKSUM = "file://${COREBASE}/LICENSE.MIT;md5=030cb33d2af49ccebca74d0588b84a21"
 
 IMAGE_PREPROCESS_COMMAND = "rootfs_update_timestamp ;"
 
