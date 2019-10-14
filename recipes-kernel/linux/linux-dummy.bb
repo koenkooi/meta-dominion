@@ -5,15 +5,15 @@ where you wish to build the kernel externally from the build system."
 SECTION = "kernel"
 
 LICENSE = "GPLv2"
-LIC_FILES_CHKSUM = "file://${WORKDIR}/COPYING.GPL;md5=751419260aa954499f7abaabaa882bbe"
+LIC_FILES_CHKSUM = "file://COPYING;md5=bbea815ee2795b2f4230826c0c6b8814"
 
 inherit kernel siteinfo
 
-PV = "4.10.12"
+PV = "5.3.6"
 KERNEL_VERSION = "${PV}"
 
-SRC_URI = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git;branch=linux-4.10.y"
-SRCREV_pn-${PN} = "055c0a94117c3c9950ebb7d0c262ae64808bd266"
+SRC_URI = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git;branch=linux-5.3.y"
+SRCREV_pn-${PN} = "a2fc8ee6676067f27d2f5c6e4d512adff3d9938c"
 S = "${WORKDIR}/git"
 
 do_configure() {
