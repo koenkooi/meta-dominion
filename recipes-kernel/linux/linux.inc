@@ -6,7 +6,7 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=d7810fab7487fb0aad327b76f1be7cd7"
 
 inherit kernel siteinfo
 
-KERNEL_CONFIG_COMMAND = "oe_runmake_call -C ${S} CC="${KERNEL_CC}" O=${B} olddefconfig || oe_runmake -C ${S} O=${B} CC="${KERNEL_CC}" oldnoconfig"
+#KERNEL_CONFIG_COMMAND = "oe_runmake_call -C ${S} CC="${KERNEL_CC}" O=${B} olddefconfig || oe_runmake -C ${S} O=${B} CC="${KERNEL_CC}" oldnoconfig"
 
 PATCHTOOL = "git"
 PATCH_COMMIT_FUNCTIONS = "1"
@@ -148,7 +148,7 @@ do_configure_prepend() {
         oe_runmake -C ${S} O=${B} savedefconfig && cp ${B}/defconfig ${WORKDIR}/defconfig.saved
 }
 
-EXTRA_OEMAKE += "LOADADDR=${UBOOT_LOADADDRESS}"
+EXTRA_OEMAKE += "-C ${S} O=${B} LOADADDR=${UBOOT_LOADADDRESS}"
 
 do_install_append() {
         for DTB in ${KERNEL_DEVICETREE}; do
