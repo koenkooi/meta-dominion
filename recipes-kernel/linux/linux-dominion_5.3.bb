@@ -68,6 +68,7 @@ KERNEL_CONFIG_FRAGMENTS_append_x86-64 = " \
 
 do_configure_prepend() {
 	if [ -e ${WORKDIR}/am335x-pm-firmware.elf ] ; then
+		mkdir -p ${S}/firmware
 		cp ${WORKDIR}/am* ${S}/firmware/
 	fi
 }
