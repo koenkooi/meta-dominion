@@ -148,7 +148,8 @@ do_configure_prepend() {
         oe_runmake -C ${S} O=${B} savedefconfig && cp ${B}/defconfig ${WORKDIR}/defconfig.saved
 }
 
-EXTRA_OEMAKE += "-C ${S} O=${B} LOADADDR=${UBOOT_LOADADDRESS}"
+EXTRA_OEMAKE += " -C ${S} O=${B} LOADADDR=${UBOOT_LOADADDRESS}"
+KERNEL_EXTRA_ARGS += " -C ${S} O=${B}"
 
 do_install_append() {
         for DTB in ${KERNEL_DEVICETREE}; do
