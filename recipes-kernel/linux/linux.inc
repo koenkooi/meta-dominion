@@ -148,7 +148,8 @@ do_configure_prepend() {
         oe_runmake -C ${S} O=${B} savedefconfig && cp ${B}/defconfig ${WORKDIR}/defconfig.saved
 }
 
-EXTRA_OEMAKE += "LOADADDR=${UBOOT_LOADADDRESS}"
+EXTRA_OEMAKE += " -C ${S} O=${B} LOADADDR=${UBOOT_LOADADDRESS}"
+KERNEL_EXTRA_ARGS += " -C ${S} O=${B}"
 
 do_install_append() {
         for DTB in ${KERNEL_DEVICETREE}; do
@@ -161,7 +162,8 @@ do_install_append() {
                         rm -f ${D}/${KERNEL_IMAGEDEST}/devicetree-${DTB_SYMLINK_NAME}.${DTB_EXT}
                 done
         done
-}	
+}
+
 do_deploy_append() {
         for DTB in ${KERNEL_DEVICETREE}; do
                 DTB=`normalize_dtb "${DTB}"`
@@ -181,6 +183,19 @@ do_deploy_append() {
                         install -m 0644 ${DTB_PATH} ${DEPLOYDIR}/
                 done
         done
+}
+
+do_deploy_append() {
+	for dtbf in ${KERNEL_DEVICETREE}; do
+		dtb=`normalize_dtb "$dtbf"`
+		dtb_ext=${dtb##*.}
+		dtb_base_name=`basename $dtb .$dtb_ext`
+
+		rm -f ${DEPLOYDIR}/$dtb_base_name-${KERNEL_DTB_NAME}.$dtb_ext
+		rm -f ${DEPLOYDIR}/$dtb_base_name-${KERNEL_DTB_LINK_NAME}.$dtb_ext
+
+		install -m 0644 ${D}/${KERNEL_IMAGEDEST}/$dtb_base_name.$dtb_ext ${DEPLOYDIR} 
+	done
 }
 
 # Automatically depend on lzop/lz4-native if CONFIG_KERNEL_LZO/LZ4 is enabled
