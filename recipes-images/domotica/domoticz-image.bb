@@ -19,7 +19,7 @@ IMAGE_INSTALL += " \
 	systemd-analyze \
 	cpufreq-tweaks \
         fixmac \
-	bash tar wget curl screen rsync procps pigz \
+	bash tar wget curl screen rsync procps pigz xz \
 	dracut \
 	collectd net-snmp \
         e2fsprogs-resize2fs gptfdisk parted util-linux \
@@ -28,6 +28,7 @@ IMAGE_INSTALL += " \
         python-dev python-modules python-pip \
         python3-dev python3-modules python3-pip \
         domoticz \
+	jq \
         ${CONMANPKGS} \
 "
 
