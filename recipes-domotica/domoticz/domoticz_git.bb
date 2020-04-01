@@ -7,9 +7,9 @@ DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto"
 
 inherit cmake pkgconfig useradd systemd
 
-PV = "4.11316+git${SRCPV}"
+PV = "2020.1.11839+git${SRCPV}"
 
-SRCREV = "0ee1110a61a72173d9089d30bf73c577d1f8c3eb"
+SRCREV = "139d994e5755ce289693c6040cdc731d79386f40"
 SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
@@ -29,9 +29,9 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DOPENZWAVE_LIBRARY_DIRS=${STAGING_LIBDIR} \
                   -DUSE_STATIC_OPENZWAVE=NO \
                   -DUSE_STATIC_LIBSTDCXX=NO \
-                  -DUSE_BUILTIN_MQTT=NO \
                   -DUSE_BUILTIN_SQLITE=NO \
                   -DUSE_BUILTIN_ZLIB=NO \
+                  -DUSE_PRECOMPILED_HEADER=NO \
                 "
 
 CXXFLAGS_append = " -std=c++11 -flto=jobserver"
