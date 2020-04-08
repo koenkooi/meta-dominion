@@ -8,9 +8,9 @@ inherit pkgconfig
 
 DEPENDS = "udev coreutils-native libxml2-native"
 
-SRCREV = "62444b0f979c337d2091d77d89cf63c2ae9775cf"
+SRCREV = "e3bae88f29139032c736144b67e7c67d3a764b2b"
 # counts git commits since 1.6 tag
-PV = "1.6.1385"
+PV = "1.6.1386"
 
 SRC_URI = "git://github.com/OpenZWave/open-zwave.git;protocol=https \
           "
