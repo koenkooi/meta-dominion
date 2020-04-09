@@ -3,9 +3,9 @@ SUMMARY = "Domoticz is a Home Automation system design to control various device
 LICENSE = "GPLv3"
 LIC_FILES_CHKSUM = "file://License.txt;md5=d32239bcb673463ab874e80d47fae504"
 
-DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto libcereal"
+DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto libcereal jsoncpp"
 
-inherit cmake pkgconfig useradd systemd
+inherit cmake pkgconfig useradd systemd manpages
 
 PV = "2020.1.11921+git${SRCPV}"
 
@@ -36,11 +36,19 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                 "
 
 
-CXXFLAGS_append = " -std=c++11 -flto=jobserver"
+CXXFLAGS_append = " -std=c++11"
+
+#  -flto=jobserver
 
 # Lower cmake version
 nodo_configure_prepend() {
 	sed -i -e s:3.16.0:3.10.0:g ${S}/CMakeLists.txt
+}
+
+do_install_prepend() {
+    for manpage in mosquitto_pub.1 mosquitto_passwd.1 mosquitto_sub.1 mosquitto_rr.1 libmosquitto.3 mosquitto.conf.5 mosquitto-tls.7 mqtt.7 mosquitto.8 ; do
+        touch ${S}/extern/mosquitto/man/${manpage}
+    done
 }
 
 do_install_append() {
@@ -77,6 +85,7 @@ do_install_append() {
             ${WORKDIR}/domoticz.service > ${D}${systemd_unitdir}/system/domoticz.service
 }
 
+INSANE_SKIP_${PN} = "dev-so"
 FILES_${PN}-dbg += "${localstatedir}/lib/domoticz/.debug/"
 
 SYSTEMD_SERVICE_${PN} = "domoticz.service"
