@@ -10,7 +10,9 @@ DEPENDS = "udev coreutils-native libxml2-native"
 
 SRCREV = "e3bae88f29139032c736144b67e7c67d3a764b2b"
 # counts git commits since 1.6 tag
-PV = "1.6.1386"
+PV = "1.6.1075"
+# ... and upstream changed the counter algo to go backwards a thousand commits :(
+PE = "1"
 
 SRC_URI = "git://github.com/OpenZWave/open-zwave.git;protocol=https \
           "
