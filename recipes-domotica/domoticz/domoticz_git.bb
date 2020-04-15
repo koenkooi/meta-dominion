@@ -7,9 +7,9 @@ DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto libcer
 
 inherit cmake pkgconfig useradd systemd manpages
 
-PV = "2020.1.11921+git${SRCPV}"
+PV = "2020.1.11922+git${SRCPV}"
 
-SRCREV = "1fb2c1e80e627a2d1474f0e3cd21859133aa215d"
+SRCREV = "ab6c15e6775df95a49d7225e825daaaa145e970e"
 SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
@@ -32,18 +32,12 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DUSE_STATIC_LIBSTDCXX=NO \
                   -DUSE_BUILTIN_SQLITE=NO \
                   -DUSE_BUILTIN_ZLIB=NO \
+                  -DUSE_BUILTIN_MQTT=NO \
+                  -DUSE_BUILTIN_JSONCPP=NO \
                   -DUSE_PRECOMPILED_HEADER=NO \
                 "
 
-
-CXXFLAGS_append = " -std=c++11"
-
-#  -flto=jobserver
-
-# Lower cmake version
-nodo_configure_prepend() {
-	sed -i -e s:3.16.0:3.10.0:g ${S}/CMakeLists.txt
-}
+CXXFLAGS_append = " -std=c++11 -flto=jobserver"
 
 do_install_prepend() {
     for manpage in mosquitto_pub.1 mosquitto_passwd.1 mosquitto_sub.1 mosquitto_rr.1 libmosquitto.3 mosquitto.conf.5 mosquitto-tls.7 mqtt.7 mosquitto.8 ; do
