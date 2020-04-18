@@ -3,14 +3,14 @@ SUMMARY = "Domoticz is a Home Automation system design to control various device
 LICENSE = "GPLv3"
 LIC_FILES_CHKSUM = "file://License.txt;md5=d32239bcb673463ab874e80d47fae504"
 
-DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto"
+DEPENDS = "lua sqlite3 boost curl openssl libusb zlib openzwave mosquitto libcereal jsoncpp"
 
-inherit cmake pkgconfig useradd systemd
+inherit cmake pkgconfig useradd systemd manpages
 
-PV = "2020.1.11839+git${SRCPV}"
+PV = "2020.1.11939+git${SRCPV}"
 
-SRCREV = "139d994e5755ce289693c6040cdc731d79386f40"
-SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=development \
+SRCREV = "ab6c15e6775df95a49d7225e825daaaa145e970e"
+SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-WebServer-crude-workaround-for-buffer-overflow.patch \
            file://domoticz.service \
           "
@@ -27,10 +27,13 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DCURL_LIBRARIES=${STAGING_LIBDIR} \
                   -DCURL_INCLUDE_DIR=${STAGING_INCDIR} \
                   -DOPENZWAVE_LIBRARY_DIRS=${STAGING_LIBDIR} \
+                  -DOPENZWAVE_INCLUDE_DIRS=${STAGING_INCDIR} \
                   -DUSE_STATIC_OPENZWAVE=NO \
                   -DUSE_STATIC_LIBSTDCXX=NO \
                   -DUSE_BUILTIN_SQLITE=NO \
                   -DUSE_BUILTIN_ZLIB=NO \
+                  -DUSE_BUILTIN_MQTT=NO \
+                  -DUSE_BUILTIN_JSONCPP=NO \
                   -DUSE_PRECOMPILED_HEADER=NO \
                 "
 
