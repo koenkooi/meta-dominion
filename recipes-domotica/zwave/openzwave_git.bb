@@ -8,9 +8,9 @@ inherit pkgconfig
 
 DEPENDS = "udev coreutils-native libxml2-native"
 
-SRCREV = "e3bae88f29139032c736144b67e7c67d3a764b2b"
+SRCREV = "07ea22bb6f533add771737bcd1f06c43cabfd261"
 # counts git commits since 1.6 tag
-PV = "1.6.1075"
+PV = "1.6.1136"
 # ... and upstream changed the counter algo to go backwards a thousand commits :(
 PE = "1"
 
