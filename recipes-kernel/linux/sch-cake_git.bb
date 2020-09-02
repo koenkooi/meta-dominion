@@ -4,10 +4,12 @@ LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://sch_cake.c;beginline=1;endline=36;md5=0af14571e97cad521fe4fb190d841633"
 
 # Made up version
-PV = "2018.08"
+PV = "2020.01"
 
-SRCREV = "9f052d92953501b8808928a3b0c89b27742e0de2"
-SRC_URI = "git://github.com/dtaht/sch_cake.git;protocol=https;branch=master" 
+SRCREV = "787329d00b5ad5ad1cbd772460ed99f12d762a1a"
+SRC_URI = "git://github.com/dtaht/sch_cake.git;protocol=https;branch=master \
+           file://0001-cake-4.3.0-hack.patch \
+          "
 
 S = "${WORKDIR}/git"
 

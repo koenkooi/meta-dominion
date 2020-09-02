@@ -1,0 +1,26 @@
+From fe2313755473b115b7fdcdcffdb67475eac1bd6f Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Tue, 28 Apr 2020 15:22:28 +0200
+Subject: [PATCH] cake: 4.3.0 hack
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ sch_cake.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/sch_cake.c b/sch_cake.c
+index 6390a5f..c591f5c 100644
+--- a/sch_cake.c
++++ b/sch_cake.c
+@@ -88,6 +88,8 @@
+ #define CAKE_FLOW_MASK 63
+ #define CAKE_FLOW_NAT_FLAG 64
+ 
++#define qdisc_tree_reduce_backlog(_a, _b, _c) qdisc_tree_decrease_qlen(_a, _b)
++
+ /* struct cobalt_params - contains codel and blue parameters
+  * @interval:	codel initial drop rate
+  * @target:     maximum persistent sojourn time & blue update rate
+-- 
+2.0.1
+
