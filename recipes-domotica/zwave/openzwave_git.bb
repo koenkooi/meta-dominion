@@ -8,11 +8,11 @@ inherit pkgconfig
 
 DEPENDS = "udev coreutils-native libxml2-native"
 
-SRCREV = "a9d57fccf045d6adca8ab172f982688844ddb512"
+SRCREV = "e5ed77cb05b3773fe13444091a96811acc548f04"
 # counts git commits since 1.6 tag
 # ... and upstream changed the counter algo to go backwards a thousand commits :(
 PE = "1"
-PV = "1.6.1570"
+PV = "1.6.1956"
 
 SRC_URI = "git://github.com/OpenZWave/open-zwave.git;protocol=https \
           "
