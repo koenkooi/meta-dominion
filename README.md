@@ -23,8 +23,6 @@ And optionally:
 	branch: master
 	revision: ad39f6523a214fa468c970b91e2d71951e753f05
 
-Please follow the recommended setup procedures of your OE distribution. For Angstrom that is http://www.angstrom-distribution.org/building-angstrom, other distros should have similar online resources.
-
 
 Contributing
 -------------------------

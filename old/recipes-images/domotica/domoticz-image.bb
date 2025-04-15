@@ -1,32 +1,39 @@
-#Angstrom base image
+#Angstrom image to test systemd
 
 LICENSE = "MIT"
-LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+LIC_FILES_CHKSUM = "file://${COREBASE}/LICENSE;md5=4d92cd373abda3937c2bc47fbc49d690"
 
-inherit core-image
+IMAGE_PREPROCESS_COMMAND = "rootfs_update_timestamp ;"
 
 DISTRO_UPDATE_ALTERNATIVES ??= ""
 ROOTFS_PKGMANAGE_PKGS ?= '${@oe.utils.conditional("ONLINE_PACKAGE_MANAGEMENT", "none", "", "${ROOTFS_PKGMANAGE} ${DISTRO_UPDATE_ALTERNATIVES}", d)}'
 
-# Debug features, disable if wanted
 IMAGE_FEATURES += "empty-root-password allow-empty-password"
+CONMANPKGS ??= ""
 
-# Debug tools, leave in
-IMAGE_FEATURES += "package-management nfs-client ssh-server-dropbear"
-
-CORE_IMAGE_EXTRA_INSTALL += " \
-        domoticz \
+IMAGE_INSTALL += " \
+	angstrom-packagegroup-boot \
+	packagegroup-basic \
 	${ROOTFS_PKGMANAGE_PKGS} \
-        bash tar wget curl screen rsync procps pigz \
-        net-snmp \
+	update-alternatives-opkg \
+	systemd-analyze \
+	cpufreq-tweaks \
+        fixmac \
+	bash tar wget curl screen rsync procps pigz \
+	dracut \
+	collectd net-snmp \
         e2fsprogs-resize2fs gptfdisk parted util-linux \
-	systemd-networkd systemd-analyze udev-hwdb \
-        avahi-daemon avahi-utils \
-        vim \
-        git \
         linux-firmware \
-        kernel-modules \
+	kernel-modules \
+	sch-cake \
+        domoticz \
+        ${CONMANPKGS} \
 "
+
+IMAGE_DEV_MANAGER   = "udev"
+IMAGE_INIT_MANAGER  = "systemd"
+IMAGE_INITSCRIPTS   = " "
+IMAGE_LOGIN_MANAGER = "busybox shadow"
 
 export IMAGE_BASENAME = "Domoticz-image"
 
@@ -40,8 +47,6 @@ Name=en*
 
 [Network]
 DHCP=yes
-LLDP=yes
-EmitLLDP=yes
 EOF
 
 	cat << EOF > ${IMAGE_ROOTFS}${sysconfdir}/systemd/network/11-eth.network
@@ -50,8 +55,7 @@ Name=eth*
 
 [Network]
 DHCP=yes
-LLDP=yes
-EmitLLDP=yes
 EOF
 }
 
+inherit image
