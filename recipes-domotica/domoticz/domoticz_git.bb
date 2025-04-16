@@ -7,7 +7,7 @@ DEPENDS = "python3 lua sqlite3 boost curl openssl libusb zlib openzwave mosquitt
 
 inherit cmake pkgconfig useradd systemd manpages python3targetconfig
 
-PV = "2024.7.16627+git${SRCPV}"
+PV = "2025.1.16627+git${SRCPV}"
 
 SRCREV = "1eb2e944f05b745c1815062681be3ea5d2352e60"
 SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
