@@ -18,12 +18,18 @@ CORE_IMAGE_EXTRA_INSTALL += " \
         domoticz \
 	${ROOTFS_PKGMANAGE_PKGS} \
         bash tar wget curl screen rsync procps pigz \
+        openssh-ssh openssh-scp openssh-sftp \
         net-snmp \
         e2fsprogs-resize2fs gptfdisk parted util-linux \
-	systemd-networkd systemd-analyze udev-hwdb \
-        avahi-daemon avahi-utils \
+	systemd-networkd iwd \
+        systemd-analyze udev-hwdb \
+        avahi-daemon avahi-utils lldpd \
+        htop \
+        python3-pip \
+        tzdata \
         vim \
         git \
+	jq \
         linux-firmware \
         kernel-modules \
 "
