@@ -85,6 +85,7 @@ USERADD_PARAM:${PN} = " \
 
 # Domoticz is mostly used in combination with a smart meter (ftdi dongles) or an rftrxx (acm based).
 RRECOMMENDS:${PN} += "python3 \
+                      rtl433 \
                       kernel-module-cdc-acm \
                       kernel-module-usbserial \
                      "
