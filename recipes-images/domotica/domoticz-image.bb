@@ -15,23 +15,24 @@ IMAGE_FEATURES += "empty-root-password allow-empty-password"
 IMAGE_FEATURES += "package-management nfs-client ssh-server-dropbear"
 
 CORE_IMAGE_EXTRA_INSTALL += " \
-        domoticz \
+	domoticz \
 	${ROOTFS_PKGMANAGE_PKGS} \
-        bash tar wget curl screen rsync procps pigz \
-        openssh-ssh openssh-scp openssh-sftp \
-        net-snmp \
-        e2fsprogs-resize2fs gptfdisk parted util-linux \
+	bash tar wget curl screen rsync procps pigz \
+	openssh-ssh openssh-scp openssh-sftp \
+	net-snmp \
+	e2fsprogs-resize2fs gptfdisk parted util-linux \
 	systemd-networkd iwd \
-        systemd-analyze udev-hwdb \
-        avahi-daemon avahi-utils lldpd \
-        htop \
-        python3-pip \
-        tzdata \
-        vim \
-        git \
+	systemd-analyze udev-hwdb \
+	avahi-daemon avahi-utils lldpd \
+	htop \
+	python3-pip \
+	tzdata \
+	vim \
+	git \
 	jq \
-        linux-firmware \
-        kernel-modules \
+	pv \
+	linux-firmware \
+	kernel-modules \
 "
 
 export IMAGE_BASENAME = "Domoticz-image"
