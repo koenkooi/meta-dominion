@@ -1,0 +1,21 @@
+Upstream-Status: Inappropriate [OE specific]
+
+Index: apcupsd-3.14.14/autoconf/targets.mak
+===================================================================
+--- apcupsd-3.14.14.orig/autoconf/targets.mak
++++ apcupsd-3.14.14/autoconf/targets.mak
+@@ -295,10 +295,13 @@ else
+ 	@$(ECHO) "--> Not building PDF due to missing rst2pdf"
+ endif
+ 
++MAN ?= man
++COL ?= col
++
+ # Format a manpage into plain text
+ define MANIFY
+ 	@$(ECHO) "  MAN  " $(1) -\> $(2)
+-	$(V)man ./$(1) | col -b > $(2)
++	$(V)$(MAN) ./$(1) | $(COL) -b > $(2)
+ endef
+ 
+ # Rule to build a Windows resource object from the source RC file
