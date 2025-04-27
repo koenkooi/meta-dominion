@@ -1,0 +1,34 @@
+From b126504a7fa811578438866df619a1d4bd56941a Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sun, 27 Apr 2025 15:52:19 +0200
+Subject: [PATCH 6/6] AnnaThermostat: add support for valve_position
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 1b1133d08..b7b0afd8f 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -762,6 +762,15 @@ void CAnnaThermostat::GetMeterDetails()
+                     SendHumiditySensor(applianceIDhex, 255, humidity, ApplianceName + " " + sname);
+                 }
+             }
++	    else if (sname == "valve_position")
++            {
++                tmpstr = GetPeriodMeasurement(pElem);
++                if (!tmpstr.empty())
++                {
++                    float valveposition = (float)atof(tmpstr.c_str()) * 100;
++                    SendPercentageSensor(applianceIDhex, 0, 255, valveposition, ApplianceName + " " + sname);
++                }
++            }
+         }
+         pAppliance = pAppliance->NextSiblingElement("appliance");
+     }
+-- 
+2.33.0
+

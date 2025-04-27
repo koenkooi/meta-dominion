@@ -11,6 +11,9 @@ PV = "2025.1.16627+git${SRCPV}"
 
 SRCREV = "1eb2e944f05b745c1815062681be3ea5d2352e60"
 SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
+           file://0001-Plugwise-extract-ID-for-all-appliances-not-just-Adam.patch;patch=1 \
+           file://0002-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
+           file://0003-Plugwise-use-last-2-bytes-of-Appliance-ID-as-domotic.patch;patch=1 \
            file://domoticz.service \
           "
 
