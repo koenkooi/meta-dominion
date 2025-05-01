@@ -83,8 +83,9 @@ USERADD_PACKAGES = "${PN}"
 USERADD_PARAM:${PN} = " \
     --system --no-create-home \
     --home ${localstatedir}/lib/domoticz \
-    --groups dialout \
-    --user-group domoticz"
+    --groups dialout,plugdev \
+    --user-group domoticz \
+"
 
 # Domoticz is mostly used in combination with a smart meter (ftdi dongles) or an rftrxx (acm based).
 RRECOMMENDS:${PN} += "python3 \
