@@ -7,17 +7,19 @@ DEPENDS = "python3 lua sqlite3 boost curl openssl libusb zlib openzwave mosquitt
 
 inherit cmake pkgconfig useradd systemd manpages python3targetconfig
 
-PV = "2025.1.16627+git${SRCPV}"
+PV = "2025.1.16677+git${SRCPV}"
 
-SRCREV = "1eb2e944f05b745c1815062681be3ea5d2352e60"
+SRCREV = "14ad98012714e50a88e17fee9df09053e1d4251c"
 SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-Plugwise-extract-ID-for-all-appliances-not-just-Adam.patch;patch=1 \
            file://0002-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
            file://0003-Plugwise-use-last-2-bytes-of-Appliance-ID-as-domotic.patch;patch=1 \
+           file://0004-Plugwise-include-appliance-name-in-sensor-name.patch;patch=1 \
+           file://0005-AnnaThermostat-add-support-for-humidity-sensors.patch;patch=1 \
+           file://0006-AnnaThermostat-add-support-for-valve_position.patch \
            file://domoticz.service \
           "
 
-S = "${WORKDIR}/git"
 
 EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DBOOST_INCLUDEDIR=${STAGING_INCDIR} \
@@ -37,6 +39,7 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DUSE_BUILTIN_JSONCPP=NO \
                   -DUSE_PRECOMPILED_HEADER=NO \
                   -DGIT_SUBMODULE=NO \
+                  -DDISABLE_UPDATER=YES \
 "
 
 CXXFLAGS:append = " -std=c++17 -flto=jobserver"
