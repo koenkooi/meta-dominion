@@ -16,7 +16,6 @@ SRC_URI = "git://github.com/OpenZWave/open-zwave.git;protocol=https;nobranch=1 \
            file://5cdc891c140a35190ead9464be6965b9c7389aab.patch \
 "
 
-S = "${WORKDIR}/git"
 
 EXTRA_OEMAKE = "PREFIX=${prefix} \
                 BITBAKE_ENV=1 \
