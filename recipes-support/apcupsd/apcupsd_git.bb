@@ -10,7 +10,6 @@ SRCREV = "717ddb16c886affc4da35a8cb5cd16dfedad096a"
 
 PV = "3.14.14"
 
-S = "${WORKDIR}/git"
 
 inherit autotools-brokensep pkgconfig manpages
 
