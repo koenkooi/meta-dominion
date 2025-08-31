@@ -3,7 +3,7 @@
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-inherit core-image
+inherit core-image systemd-boot
 
 DISTRO_UPDATE_ALTERNATIVES ??= ""
 ROOTFS_PKGMANAGE_PKGS ?= '${@oe.utils.conditional("ONLINE_PACKAGE_MANAGEMENT", "none", "", "${ROOTFS_PKGMANAGE} ${DISTRO_UPDATE_ALTERNATIVES}", d)}'
@@ -12,27 +12,37 @@ ROOTFS_PKGMANAGE_PKGS ?= '${@oe.utils.conditional("ONLINE_PACKAGE_MANAGEMENT", "
 IMAGE_FEATURES += "empty-root-password allow-empty-password"
 
 # Debug tools, leave in
-IMAGE_FEATURES += "package-management nfs-client ssh-server-dropbear"
+IMAGE_FEATURES += "package-management nfs-client ssh-server-openssh"
 
 CORE_IMAGE_EXTRA_INSTALL += " \
 	domoticz \
 	${ROOTFS_PKGMANAGE_PKGS} \
+	systemd-zram-generator systemd-boot \
 	bash tar wget curl screen rsync procps pigz \
 	openssh-ssh openssh-scp openssh-sftp \
 	net-snmp \
-	e2fsprogs-resize2fs gptfdisk parted util-linux \
+	e2fsprogs-resize2fs gptfdisk parted findutils coreutils util-linux btrfs-tools \
 	systemd-networkd iwd \
 	systemd-analyze udev-hwdb \
-	avahi-daemon avahi-utils lldpd \
+	avahi-daemon avahi-utils lldpd iproute2-tc net-tools \
 	htop \
-	python3-pip \
 	tzdata \
+        cronie \
 	vim \
 	git \
 	jq \
 	pv \
+	file \
 	linux-firmware \
 	kernel-modules \
+	python3-pip \
+        python3-modules \
+	python3-psutil \
+	python3-pycryptodomex \
+	python3-setuptools \
+	go \
+        bc \
+        ethtool \
 "
 
 export IMAGE_BASENAME = "Domoticz-image"
@@ -49,6 +59,15 @@ Name=en*
 DHCP=yes
 LLDP=yes
 EmitLLDP=yes
+
+[DHCPv4]
+RouteMetric=10
+
+[IPv6AcceptRA]
+RouteMetric=10
+
+[Route]
+Metric=10
 EOF
 
 	cat << EOF > ${IMAGE_ROOTFS}${sysconfdir}/systemd/network/11-eth.network
@@ -59,6 +78,15 @@ Name=eth*
 DHCP=yes
 LLDP=yes
 EmitLLDP=yes
+
+[DHCPv4]
+RouteMetric=10
+
+[IPv6AcceptRA]
+RouteMetric=10
+
+[Route]
+Metric=10
 EOF
 }
 
