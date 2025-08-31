@@ -9,7 +9,6 @@ SRCREV = "bc32225a3fa18f151e9e2bc1dd01c6d71c270384"
 SRC_URI = "git://github.com/koenkooi/foo2zjs.git;protocol=https \
           "
 
-S = "${WORKDIR}/git"
 
 PARALLEL_MAKE = ""
 

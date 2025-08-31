@@ -12,7 +12,6 @@ PV = "0.8.0"
 SRCREV = "a33b95649a782e5563186c86a87ccbb60fa648e9"
 SRC_URI = "git://github.com/uoaerg/wavemon.git;protocol=https"
 
-S = "${WORKDIR}/git"
 
 CFLAGS += " -pthread -I${STAGING_INCDIR}/libnl3"
 

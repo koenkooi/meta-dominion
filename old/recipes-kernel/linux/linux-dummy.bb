@@ -14,7 +14,6 @@ KERNEL_VERSION = "${PV}"
 
 SRC_URI = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git;branch=linux-4.10.y"
 SRCREV_pn-${PN} = "055c0a94117c3c9950ebb7d0c262ae64808bd266"
-S = "${WORKDIR}/git"
 
 do_configure() {
 	yes '' | oe_runmake -C ${S} O=${B} allnoconfig

@@ -13,6 +13,5 @@ SRCREV = "77ae6f363e0bbd667f688fbfcb1a33024c026c2d"
 
 SRC_URI = "git://github.com/linux-wpan/wpan-tools.git"
 
-S = "${WORKDIR}/git"
 
 inherit autotools pkgconfig

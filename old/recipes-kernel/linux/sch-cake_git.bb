@@ -9,7 +9,6 @@ PV = "2017.12"
 SRCREV = "5bf0b6596721e18269ee4bae6e3549c75cba923a"
 SRC_URI = "git://github.com/dtaht/sch_cake.git;protocol=https;branch=cobalt" 
 
-S = "${WORKDIR}/git"
 
 inherit module
 

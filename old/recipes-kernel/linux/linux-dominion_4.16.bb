@@ -9,7 +9,6 @@ COMPATIBLE_MACHINE = "(rogue|dominion-old|dominion|beast|macbook|soekris-net6501
 
 FILESPATH =. "${FILE_DIRNAME}/linux-dominion-4.16:${FILE_DIRNAME}/linux-dominion-4.16/${MACHINE}:"
 
-S = "${WORKDIR}/git"
 
 PV = "4.16.1"
 

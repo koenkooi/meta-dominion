@@ -9,7 +9,6 @@ PV = "0.0+git${SRCPV}"
 SRCREV = "f669ba772b9dc5839a3cf9990691cf912ea443f4"
 SRC_URI = "git://github.com/klirichek/zj-58.git;protocol=https"
 
-S = "${WORKDIR}/git"
 
 CLEANBROKEN = "1"
 
