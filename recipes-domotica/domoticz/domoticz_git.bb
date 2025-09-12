@@ -7,9 +7,9 @@ DEPENDS = "python3 lua sqlite3 boost curl openssl libusb zlib openzwave mosquitt
 
 inherit cmake pkgconfig useradd systemd manpages python3targetconfig
 
-PV = "2025.1.16677+git${SRCPV}"
+PV = "2025.1.16782+git${SRCPV}"
 
-SRCREV = "14ad98012714e50a88e17fee9df09053e1d4251c"
+SRCREV = "3ed178aa42de26a439136a01d2788ef7e0592d3e"
 SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
            file://0001-Plugwise-extract-ID-for-all-appliances-not-just-Adam.patch;patch=1 \
            file://0002-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
