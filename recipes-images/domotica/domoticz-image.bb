@@ -40,9 +40,13 @@ CORE_IMAGE_EXTRA_INSTALL += " \
 	python3-psutil \
 	python3-pycryptodomex \
 	python3-setuptools \
-	go \
+	python3-term \
+        go \
         bc \
         ethtool \
+	libgpiod-tools \
+	gpsd pps-tools gps-utils chrony setserial \
+	dracut \
 "
 
 export IMAGE_BASENAME = "Domoticz-image"
@@ -87,6 +91,25 @@ RouteMetric=10
 
 [Route]
 Metric=10
+EOF
+
+	cat << EOF > ${IMAGE_ROOTFS}${sysconfdir}/systemd/network/12-wlan.network
+[Match]
+Name=wlan*
+
+[Network]
+DHCP=yes
+LLDP=yes
+EmitLLDP=yes
+
+[DHCPv4]
+RouteMetric=100
+
+[IPv6AcceptRA]
+RouteMetric=100
+
+[Route]
+Metric=100
 EOF
 }
 
