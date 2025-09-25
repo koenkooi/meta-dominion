@@ -1,11 +1,12 @@
 SUMMARY = "RTW89 Wi-Fi driver"
 DESCRIPTION = "RealTek RTW89 driver"
 
-LICENSE = "CLOSED"
+LICENSE = "GPL-2.0-only"
+LIC_FILES_CHKSUM = "file://rtw8851b.c;beginline=1;endline=2;md5=f61578bcdec059a3c999594e58bfc0ae"
 
 inherit module
 
-SRCREV = "8a8ba9bdee85c54b55efa27bd92e6475a77da7af"
+SRCREV = "8bdbb48aa88e83eb7dfac5e9a4ad537c707d6c4f"
 SRC_URI = "git://github.com/morrownr/rtw89.git;branch=main;protocol=https \
            file://0001-Makefile-remove-PCIe-variants-they-don-t-build.patch \
            "
