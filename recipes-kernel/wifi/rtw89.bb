@@ -26,5 +26,5 @@ do_install() {
 
 FILES:${PN} += "${sysconfdir}"
 
-# For dongles that come up as USB storage and need to be eject
+# For dongles that come up as USB storage and need to be ejected
 RRECOMMENDS:${PN} += "usb-modeswitch"
