@@ -1,7 +1,7 @@
-From dc138aa2519042c308b752cdf09f527877a57582 Mon Sep 17 00:00:00 2001
+From 3a9f8d8b729100c547b63ae1f762e31d329d5c9a Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Sun, 27 Apr 2025 14:22:58 +0200
-Subject: [PATCH 3/3] Plugwise: use last 2 bytes of Appliance ID as domoticz ID
+Subject: [PATCH] Plugwise: use last 2 bytes of Appliance ID as domoticz ID
 
 In its current form, the Anna plugin assigns a non-deterministic number
 to each 'device', leading to all devices getting a new, different ID
@@ -33,7 +33,7 @@ Upstream-Status: Inappropriate [WIP]
  1 file changed, 24 insertions(+), 22 deletions(-)
 
 diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
-index 95859d584..810891273 100644
+index 351f27c2f..6dfc8148c 100644
 --- a/hardware/AnnaThermostat.cpp
 +++ b/hardware/AnnaThermostat.cpp
 @@ -457,6 +457,7 @@ void CAnnaThermostat::GetMeterDetails()
@@ -232,5 +232,5 @@ index 95859d584..810891273 100644
              }
          }
 -- 
-2.33.0
+2.47.3
 

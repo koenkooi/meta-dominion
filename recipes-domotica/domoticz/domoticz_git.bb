@@ -7,10 +7,17 @@ DEPENDS = "python3 lua sqlite3 boost curl openssl libusb zlib openzwave mosquitt
 
 inherit cmake pkgconfig useradd systemd manpages python3targetconfig
 
-PV = "2025.1.16782+git${SRCPV}"
+PV = "2026.2+git${SRCPV}"
 
-SRCREV = "3ed178aa42de26a439136a01d2788ef7e0592d3e"
-SRC_URI = "gitsm://github.com/domoticz/domoticz.git;protocol=https;branch=development \
+SRCREV = "facfb476a1729ab4d0fb992b47bd28c0418efcf7"
+SRCREV_jwtcpp = "3e037df3e669633a3044618e30550ea2f212e915"
+SRCREV_libwebem = "0aa092796657c7007f04eca66471c164bbec7ada"
+SRCREV_FORMAT = "default_jwtcpp_libwebem"
+S = "${UNPACKDIR}/domoticz"
+
+SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=master;destsuffix=domoticz \
+           git://github.com/Thalhammer/jwt-cpp.git;protocol=https;name=jwtcpp;branch=master;destsuffix=domoticz/extern/jwtcpp \
+           git://github.com/domoticz/libwebem.git;protocol=https;name=libwebem;branch=master;destsuffix=domoticz/extern/libwebem \
            file://0001-Plugwise-extract-ID-for-all-appliances-not-just-Adam.patch;patch=1 \
            file://0002-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
            file://0003-Plugwise-use-last-2-bytes-of-Appliance-ID-as-domotic.patch;patch=1 \
@@ -29,6 +36,7 @@ EXTRA_OECMAKE = " -DWITH_LIBUSB=YES \
                   -DUSE_OPENSSL_STATIC=NO \
                   -DCURL_LIBRARIES=${STAGING_LIBDIR} \
                   -DCURL_INCLUDE_DIR=${STAGING_INCDIR} \
+                  -DOpenZWave=${STAGING_LIBDIR}/libopenzwave.so \
                   -DOPENZWAVE_LIBRARY_DIRS=${STAGING_LIBDIR} \
                   -DOPENZWAVE_INCLUDE_DIRS=${STAGING_INCDIR}/openzwave \
                   -DUSE_STATIC_OPENZWAVE=NO \
@@ -63,7 +71,7 @@ do_install:append() {
     # keep them in /var/lib/domoticz
 
     # Executables
-    install -d ${D}${bindir} 
+    install -d ${D}${bindir}
     mv ${D}${localstatedir}/lib/domoticz/domoticz ${D}${bindir}
     # internal update script, disable
     rm -f ${D}${localstatedir}/lib/domoticz/updatedomo
@@ -73,7 +81,7 @@ do_install:append() {
     install -d ${D}${systemd_unitdir}/system
     sed -e s:LIBDIR:${localstatedir}/lib:g \
         -e s:BINDIR:${bindir}:g \
-	-e s:/var/lib/domoticz/www:${datadir}/${BPN}/www:g \
+        -e s:/var/lib/domoticz/www:${datadir}/${BPN}/www:g \
         -e s:/var:${localstatedir}:g \
             ${UNPACKDIR}/domoticz.service > ${D}${systemd_unitdir}/system/domoticz.service
 }
@@ -96,3 +104,5 @@ RRECOMMENDS:${PN} += "python3 \
                       kernel-module-cdc-acm \
                       kernel-module-usbserial \
                      "
+
+RDEPENDS:${PN} += "bash"

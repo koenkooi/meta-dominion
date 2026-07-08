@@ -1,7 +1,7 @@
-From b126504a7fa811578438866df619a1d4bd56941a Mon Sep 17 00:00:00 2001
+From 0663888e7753d8500e5e7904e36e950c1355e77c Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Sun, 27 Apr 2025 15:52:19 +0200
-Subject: [PATCH 6/6] AnnaThermostat: add support for valve_position
+Subject: [PATCH] AnnaThermostat: add support for valve_position
 
 Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
 Upstream-Status: Inappropriate [WIP]
@@ -10,7 +10,7 @@ Upstream-Status: Inappropriate [WIP]
  1 file changed, 9 insertions(+)
 
 diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
-index 1b1133d08..b7b0afd8f 100644
+index 9b4379cbb..1014b8565 100644
 --- a/hardware/AnnaThermostat.cpp
 +++ b/hardware/AnnaThermostat.cpp
 @@ -762,6 +762,15 @@ void CAnnaThermostat::GetMeterDetails()
@@ -30,5 +30,5 @@ index 1b1133d08..b7b0afd8f 100644
          pAppliance = pAppliance->NextSiblingElement("appliance");
      }
 -- 
-2.33.0
+2.47.3
 

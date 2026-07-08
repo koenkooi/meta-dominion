@@ -1,7 +1,7 @@
-From 39f6b0ae39eba6707732f411dc11251ad7232687 Mon Sep 17 00:00:00 2001
+From 7fb4961d53d878232744de68fa62862136ec0482 Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Sun, 27 Apr 2025 15:24:00 +0200
-Subject: [PATCH 4/6] Plugwise: include appliance name in sensor name
+Subject: [PATCH] Plugwise: include appliance name in sensor name
 
 Multiple devices in an Anna/Adam system can provide the same measurement
 , e.g. 'temperature'. Add a namespace to be able to distinguish between
@@ -17,7 +17,7 @@ Upstream-Status: Inappropriate [WIP]
  1 file changed, 17 insertions(+), 17 deletions(-)
 
 diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
-index 810891273..ef7e77ed8 100644
+index 6dfc8148c..0eec88190 100644
 --- a/hardware/AnnaThermostat.cpp
 +++ b/hardware/AnnaThermostat.cpp
 @@ -511,7 +511,7 @@ void CAnnaThermostat::GetMeterDetails()
@@ -162,5 +162,5 @@ index 810891273..ef7e77ed8 100644
              }
          }
 -- 
-2.33.0
+2.47.3
 

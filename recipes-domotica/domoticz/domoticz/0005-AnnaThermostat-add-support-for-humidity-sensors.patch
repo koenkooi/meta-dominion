@@ -1,7 +1,7 @@
-From 092164ea1d93eaf78c4278d43cf6f058ecb7bd8b Mon Sep 17 00:00:00 2001
+From 290650ee3e7a945c68e31df16731b039e67771a5 Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Sun, 27 Apr 2025 15:44:59 +0200
-Subject: [PATCH 5/6] AnnaThermostat: add support for humidity sensors
+Subject: [PATCH] AnnaThermostat: add support for humidity sensors
 
 Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
 Upstream-Status: Inappropriate [WIP]
@@ -10,7 +10,7 @@ Upstream-Status: Inappropriate [WIP]
  1 file changed, 9 insertions(+)
 
 diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
-index ef7e77ed8..1b1133d08 100644
+index 0eec88190..9b4379cbb 100644
 --- a/hardware/AnnaThermostat.cpp
 +++ b/hardware/AnnaThermostat.cpp
 @@ -753,6 +753,15 @@ void CAnnaThermostat::GetMeterDetails()
@@ -30,5 +30,5 @@ index ef7e77ed8..1b1133d08 100644
          pAppliance = pAppliance->NextSiblingElement("appliance");
      }
 -- 
-2.33.0
+2.47.3
 
