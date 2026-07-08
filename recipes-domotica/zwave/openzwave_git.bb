@@ -29,6 +29,8 @@ EXTRA_OEMAKE = "PREFIX=${prefix} \
 do_compile() {
 	sed -i -e 's:$(PREFIX)/etc:${sysconfdir}:g' ${S}/cpp/build/Makefile
 	sed -i -e 's,pkgconfigdir ?,pkgconfigdir :,g' ${S}/cpp/build/support.mk
+	# Keep MinOZW examples enabled; make format-security checks coherent under OE hardening flags.
+	sed -i -e 's/-Wno-format/-Wformat/g' ${S}/cpp/examples/MinOZW/Makefile
 	oe_runmake
 }
 
