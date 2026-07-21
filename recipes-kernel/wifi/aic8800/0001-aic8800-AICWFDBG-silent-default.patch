@@ -1,0 +1,104 @@
+From 6d2c94c52a499f5e811b1989ed13a60afe581f3a Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Tue, 21 Jul 2026 08:56:50 +0200
+Subject: [PATCH] aic8800: default AICWFDBG to silent, gate log spew
+
+Both driver modules ship a verbose default for the aicwf_dbg_level bitmask
+that gates the AICWFDBG() logging macro:
+  * aic8800_fdrv (rwnx_main.c): LOGERROR|LOGINFO|LOGFW
+  * aic_load_fw  (aic_bluetooth_main.c): LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE
+so a normal (non-debug) build floods dmesg with AICWFDBG(...) output.
+
+Gate the compile-time default behind AICWF_DBG_LEVEL_DEFAULT, defaulting to
+0 (silent). A debug build passes -DAICWF_DBG_LEVEL_DEFAULT=<mask>; the
+existing aicwf_dbg_level module parameter still raises verbosity at runtime.
+Also silence the stray non-framework printk("rx eapol").
+
+Upstream-Status: Inappropriate [OE-specific default; verbose default is upstream]
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ drivers/aic8800/aic8800_fdrv/aicwf_debug.h       | 7 +++++++
+ drivers/aic8800/aic8800_fdrv/rwnx_main.c         | 2 +-
+ drivers/aic8800/aic8800_fdrv/rwnx_rx.c           | 2 +-
+ drivers/aic8800/aic_load_fw/aic_bluetooth_main.c | 2 +-
+ drivers/aic8800/aic_load_fw/aicwf_debug.h        | 7 +++++++
+ 5 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/aic8800/aic8800_fdrv/aicwf_debug.h b/drivers/aic8800/aic8800_fdrv/aicwf_debug.h
+index 9bd1e7d..c892328 100644
+--- a/drivers/aic8800/aic8800_fdrv/aicwf_debug.h
++++ b/drivers/aic8800/aic8800_fdrv/aicwf_debug.h
+@@ -11,6 +11,13 @@
+ #define LOGSTEER		0x0020
+ #define LOGFW                   0x0200
+ 
++/* Compile-time default for aicwf_dbg_level. Production builds are silent (0).
++ * Pass -DAICWF_DBG_LEVEL_DEFAULT=<mask> (OE recipe knob AIC8800_DEBUG="1") for a
++ * verbose debug build; the aicwf_dbg_level module parameter also raises it at runtime. */
++#ifndef AICWF_DBG_LEVEL_DEFAULT
++#define AICWF_DBG_LEVEL_DEFAULT		0
++#endif
++
+ extern int aicwf_dbg_level;
+ void rwnx_data_dump(char* tag, void* data, unsigned long len);
+ 
+diff --git a/drivers/aic8800/aic8800_fdrv/rwnx_main.c b/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+index aeb5daa..046d6aa 100644
+--- a/drivers/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -548,7 +548,7 @@ static const int rwnx_hwq2uapsd[NL80211_NUM_ACS] = {
+ struct semaphore aicwf_deinit_sem;
+ atomic_t aicwf_deinit_atomic;
+ 
+-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGFW;
++int aicwf_dbg_level = AICWF_DBG_LEVEL_DEFAULT;
+ module_param(aicwf_dbg_level, int, 0660);
+ #ifdef CONFIG_DYNAMIC_PWR
+ int dynamic_pwr = 1;
+diff --git a/drivers/aic8800/aic8800_fdrv/rwnx_rx.c b/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+index 4f95335..df74d4a 100644
+--- a/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
++++ b/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+@@ -2539,7 +2539,7 @@ check_len_update:
+ 
+ 
+             if((ether_type[0] == 0x8e && ether_type[1] == 0x88) || (ether_type[0] == 0x88 && ether_type[1] == 0x8e))
+-                printk("rx eapol\n");
++                //printk("rx eapol\n");
+ 			
+ 			if (is_amsdu) {
+ //Check NETGEAR R7000 router's AMSDU packet format for compliance. start
+diff --git a/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c b/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
+index c590fb1..87ae7c0 100644
+--- a/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
++++ b/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
+@@ -20,7 +20,7 @@ int adap_test = 0;
+ char paringid[100];
+ int n_para = 1;
+ int ble_scan_wakeup_reboot_time = 1000;
+-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE;
++int aicwf_dbg_level = AICWF_DBG_LEVEL_DEFAULT;
+ int flash_erase_len = 0x400000;
+ uint32_t ad_data_filter_mask = 0;
+ uint32_t gpio_num = 2;//default select gpiob2 for fw_wakeup_host
+diff --git a/drivers/aic8800/aic_load_fw/aicwf_debug.h b/drivers/aic8800/aic_load_fw/aicwf_debug.h
+index 12fdca6..3aff451 100644
+--- a/drivers/aic8800/aic_load_fw/aicwf_debug.h
++++ b/drivers/aic8800/aic_load_fw/aicwf_debug.h
+@@ -11,6 +11,13 @@
+ #define LOGDEBUG		0x0008
+ #define LOGDATA			0x0010
+ 
++/* Compile-time default for aicwf_dbg_level. Production builds are silent (0).
++ * Pass -DAICWF_DBG_LEVEL_DEFAULT=<mask> (OE recipe knob AIC8800_DEBUG="1") for a
++ * verbose debug build; the aicwf_dbg_level module parameter also raises it at runtime. */
++#ifndef AICWF_DBG_LEVEL_DEFAULT
++#define AICWF_DBG_LEVEL_DEFAULT		0
++#endif
++
+ extern int aicwf_dbg_level;
+ void rwnx_data_dump(char* tag, void* data, unsigned long len);
+ 
+-- 
+2.47.3
+
