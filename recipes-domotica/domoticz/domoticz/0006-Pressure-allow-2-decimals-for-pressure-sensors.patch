@@ -1,7 +1,7 @@
-From 661d4a96864315b079789e8eaff36a895b81f8bc Mon Sep 17 00:00:00 2001
+From f34a1fb8e4ebca47c86feb5e08f2a4338b33fe93 Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Fri, 8 Jan 2021 13:58:55 +0100
-Subject: [PATCH] Pressure: allow 2 decimals for pressure sensors
+Subject: [PATCH 06/46] Pressure: allow 2 decimals for pressure sensors
 
 Plugwise Adam reports boiler pressure in 2 decimals, e.g. 1.53 bar, but
 domoticz internally lops off the second decimal. To make it worse,
@@ -20,6 +20,8 @@ useful values.
 
 Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
 Upstream-Status: Submitted [https://github.com/domoticz/domoticz/pull/6317]
+
+Upstream-Status: Inappropriate [WIP]
 ---
  main/SQLHelper.cpp  | 2 +-
  main/WebServer.cpp  | 2 +-
@@ -53,10 +55,10 @@ index 031650926..e56eacd0f 100644
  							root["result"][ii]["TypeImg"] = "gauge";
  							root["result"][ii]["HaveTimeout"] = bHaveTimeout;
 diff --git a/main/mainworker.cpp b/main/mainworker.cpp
-index ed5a3c293..0ebd6ee1e 100644
+index 500b76ab9..8239cb1f1 100644
 --- a/main/mainworker.cpp
 +++ b/main/mainworker.cpp
-@@ -10430,7 +10430,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
+@@ -10434,7 +10434,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
  	}
  	else if (subType == sTypePressure)
  	{
@@ -65,7 +67,7 @@ index ed5a3c293..0ebd6ee1e 100644
  		DevRowIdx = m_sql.UpdateValue(pHardware->m_HwdID, 0, ID.c_str(), Unit, devType, subType, SignalLevel, BatteryLevel, cmnd, szTmp, procResult.DeviceName, true, procResult.Username.c_str());
  		if (DevRowIdx == (uint64_t)-1)
  			return;
-@@ -10557,7 +10557,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
+@@ -10561,7 +10561,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
  			break;
  		case sTypePressure:
  			WriteMessage("subtype       = Pressure");
@@ -74,6 +76,3 @@ index ed5a3c293..0ebd6ee1e 100644
  			WriteMessage(szTmp);
  			break;
  		case sTypeBaro:
--- 
-2.47.3
-

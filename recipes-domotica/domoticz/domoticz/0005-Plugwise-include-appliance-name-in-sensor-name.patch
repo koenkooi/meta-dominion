@@ -1,7 +1,7 @@
-From 7fb4961d53d878232744de68fa62862136ec0482 Mon Sep 17 00:00:00 2001
+From a7db1bfe5b0613ba6bc0802175f4900776e70bf0 Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
 Date: Sun, 27 Apr 2025 15:24:00 +0200
-Subject: [PATCH] Plugwise: include appliance name in sensor name
+Subject: [PATCH 05/46] Plugwise: include appliance name in sensor name
 
 Multiple devices in an Anna/Adam system can provide the same measurement
 , e.g. 'temperature'. Add a namespace to be able to distinguish between
@@ -11,6 +11,8 @@ This changes the default name from e.g. "temperature" to "Jip Zithoek
 temperature".
 
 Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Upstream-Status: Inappropriate [WIP]
+
 Upstream-Status: Inappropriate [WIP]
 ---
  hardware/AnnaThermostat.cpp | 34 +++++++++++++++++-----------------
@@ -161,6 +163,3 @@ index 6dfc8148c..0eec88190 100644
                  }
              }
          }
--- 
-2.47.3
-

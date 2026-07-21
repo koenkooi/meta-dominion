@@ -1,0 +1,96 @@
+From ca1c4f7634664a16d9c4075857b5984b107afc98 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sun, 27 Apr 2025 15:44:59 +0200
+Subject: [PATCH 14/46] AnnaThermostat: add support for humidity sensors
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Upstream-Status: Inappropriate [WIP]
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 66 ++-----------------------------------
+ 1 file changed, 3 insertions(+), 63 deletions(-)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 8a1ff6079..264d35f28 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1274,75 +1274,15 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendTempSensor(applianceIDhex + 5, 255, temperature, ApplianceName + " " + sname);;
+                 }
+             }
+-			else if (sname == "outdoor_temperature")
+-			{
+-				if (!tmpstr.empty())
+-				{
+-					float temperature = (float)atof(tmpstr.c_str());
+-					SendTempSensor(applianceIDhex + 6, batterypercentage, temperature, ApplianceName + " " + sname);
+-				}
+-			}
+-			else if (sname == "solar_irradiance")
+-			{
+-				if (!tmpstr.empty())
+-				{
+-					float radiation = (float)atof(tmpstr.c_str());
+-					SendSolarRadiationSensor((unsigned char)(applianceIDhex & 0xFF), batterypercentage, radiation, ApplianceName + " " + sname);
+-				}
+-			}
+-			else if (sname == "domestic_hot_water_setpoint")
+-			{
+-				if (!tmpstr.empty())
+-				{
+-					float setpoint = (float)atof(tmpstr.c_str());
+-						SendSetPointSensor(0, 0, (uint8_t)((applianceIDhex >> 8) & 0xFF), (uint8_t)(applianceIDhex & 0xFF), 2, batterypercentage, setpoint, ApplianceName + " " + sname);
+-				}
+-			}
+             else if (sname == "humidity")
+             {
++                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+-					float humidityRaw = 0.0F;
+-					if (!isNumericValue(tmpstr, humidityRaw))
+-						continue;
+-
+-					int humidityLocal = static_cast<int>(std::lround(humidityRaw));
+-					if (humidityLocal < 0)
+-						humidityLocal = 0;
+-					if (humidityLocal > 100)
+-						humidityLocal = 100;
+-
+-					SendHumiditySensor(applianceIDhex, batterypercentage, humidityLocal, ApplianceName + " " + sname);
+-					if (!temperaturePublished && hasEffectiveTemperature)
+-					{
+-						SendTempHumSensor(applianceIDhex, batterypercentage, effectiveTemperature, humidityLocal, ApplianceName + " TempHum");
+-						temperaturePublished = true;
+-					}
+-                }
+-            }
+-	    else if (sname == "valve_position")
+-            {
+-                if (!tmpstr.empty())
+-                {
+-                    float valveposition = (float)atof(tmpstr.c_str()) * 100;
+-					SendPercentageSensor(applianceIDhex, 0, batterypercentage, valveposition, ApplianceName + " " + sname);
++                    float humidity = (float)atof(tmpstr.c_str());
++                    SendHumiditySensor(applianceIDhex, 255, humidity, ApplianceName + " " + sname);
+                 }
+             }
+-			else
+-			{
+-				if (!tmpstr.empty())
+-				{
+-					const uint8_t child = static_cast<uint8_t>(40 + (std::hash<std::string>{}(sname) % 90));
+-					float num = 0.0F;
+-					bool on = false;
+-					if (isEnabledState(tmpstr, on))
+-						SendSwitch(applianceIDhex, child, batterypercentage, on, 0, ApplianceName + " " + sname, m_Name);
+-					else if (isNumericValue(tmpstr, num))
+-						SendCustomSensor(applianceIDhex, child, batterypercentage, num, ApplianceName + " " + sname, "");
+-					else
+-						SendTextSensor(applianceIDhex, child, batterypercentage, tmpstr, ApplianceName + " " + sname);
+-				}
+-			}
+         }
+         pAppliance = pAppliance->NextSiblingElement("appliance");
+     }

@@ -1,0 +1,33 @@
+From caf509b856c9befa9a16c293f98bef65d3b7610b Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:58:22 +0200
+Subject: [PATCH 33/46] AnnaThermostat: add gateway_mode measurement
+
+Map gateway_mode to a Domoticz text sensor.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 9b1f0cdc4..8aa8e81c1 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1271,6 +1271,13 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendSwitch(applianceIDhex, 9, batterypercentage, isOn, 0, ApplianceName + " " + sname, m_Name);
+ 				}
+ 			}
++			else if (sname == "gateway_mode")
++			{
++				if (!tmpstr.empty())
++				{
++					SendTextSensor(applianceIDhex, 16, batterypercentage, tmpstr, ApplianceName + " " + sname);
++				}
++			}
+             else if (sname == "central_heater_water_pressure")
+             {
+                 if (!tmpstr.empty())

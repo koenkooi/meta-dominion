@@ -1,60 +1,64 @@
-From 3a9f8d8b729100c547b63ae1f762e31d329d5c9a Mon Sep 17 00:00:00 2001
+From ed4a7dda6ac9e64e4bb47659478088c2277b8ae0 Mon Sep 17 00:00:00 2001
 From: Koen Kooi <koen@dominion.thruhere.net>
-Date: Sun, 27 Apr 2025 14:22:58 +0200
-Subject: [PATCH] Plugwise: use last 2 bytes of Appliance ID as domoticz ID
+Date: Wed, 8 Jul 2026 16:14:19 +0200
+Subject: [PATCH 04/46] Plugwise: appliance ID extraction and stable Domoticz
+ IDs
 
-In its current form, the Anna plugin assigns a non-deterministic number
-to each 'device', leading to all devices getting a new, different ID
-when new 'devices' are added. This can and will also happen when the
-plug gets extended to add more features, e.g. adding support for the
-temperature calibration field in 'Jip' sensors.
-To make the ID both deterministic and repeatable, use the last 2 bytes
-of their Zigbee address.
-
-The exception to this are the 'Presets', the migration logic has too
-many assumptions about everything being a one room Anna setup to fix
-properly.
-
-Another issue is that having multiple sensors of the same kind will also
-lead to ID confusion.
-When using this plugin with a Plugwise Adam in a multiroom configuation,
-there will be more than one sensor of a specific type, for example one
-'Jip' temperature/humidity sensor per room and/or one 'Floor' thermostat per
-room.
-Or even in a single room config, underfloor radiant heating will likely
-have multiple zones, each zone can have a 'Tom' valve to regulate the
-flow.
+Extract appliance IDs for all appliances and derive stable Domoticz identifiers from the trailing appliance ID bytes.
 
 Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
 
 Upstream-Status: Inappropriate [WIP]
 ---
- hardware/AnnaThermostat.cpp | 46 +++++++++++++++++++------------------
- 1 file changed, 24 insertions(+), 22 deletions(-)
+ hardware/AnnaThermostat.cpp | 68 +++++++++++++++++++++----------------
+ 1 file changed, 38 insertions(+), 30 deletions(-)
 
 diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
-index 351f27c2f..6dfc8148c 100644
+index ede09a3ec..6dfc8148c 100644
 --- a/hardware/AnnaThermostat.cpp
 +++ b/hardware/AnnaThermostat.cpp
-@@ -457,6 +457,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -456,6 +456,22 @@ void CAnnaThermostat::GetMeterDetails()
+ 	while (pAppliance)
  	{
  		TiXmlHandle hAppliance = TiXmlHandle(pAppliance);
- 		std::string applianceID = "";
++		std::string applianceID = "";
 +		unsigned int applianceIDhex;
- 
- 		pAttribute = pAppliance->FirstAttribute();
- 		if (pAttribute != nullptr)
-@@ -465,7 +466,8 @@ void CAnnaThermostat::GetMeterDetails()
- 			if (aName == "id")
- 			{
- 				applianceID = pAttribute->Value();
--				Log(LOG_NORM, "AnnaTherm: Appliance ID: %s", applianceID.c_str());
++
++		pAttribute = pAppliance->FirstAttribute();
++		if (pAttribute != nullptr)
++		{
++			std::string aName = pAttribute->Name();
++			if (aName == "id")
++			{
++				applianceID = pAttribute->Value();
 +				applianceIDhex = strtoul(applianceID.substr(28,4).c_str(), NULL, 16);
 +				Log(LOG_NORM, "AnnaTherm: Appliance ID: %s, %x", applianceID.c_str(), applianceIDhex);
- 			}
- 		} else {
- 			Log(LOG_ERROR, "AnnaTherm: Cannot find appliance ID");
-@@ -509,7 +511,7 @@ void CAnnaThermostat::GetMeterDetails()
++			}
++		} else {
++			Log(LOG_ERROR, "AnnaTherm: Cannot find appliance ID");
++		}
+ 
+ 		pElem = pAppliance->FirstChildElement("name");
+ 		if (pElem == nullptr)
+@@ -467,15 +483,7 @@ void CAnnaThermostat::GetMeterDetails()
+ 
+ 		if ((m_ThermostatID.empty()) && ((ApplianceName == "Anna") || (ApplianceName == "Adam")))
+ 		{
+-			pAttribute = pAppliance->FirstAttribute();
+-			if (pAttribute != nullptr)
+-			{
+-				std::string aName = pAttribute->Name();
+-				if (aName == "id")
+-				{
+-					m_ThermostatID = pAttribute->Value();
+-				}
+-			}
++			m_ThermostatID = applianceID;
+ 		}
+ 
+ 		//Handle point_log
+@@ -503,7 +511,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float temperature = (float)atof(tmpstr.c_str());
@@ -63,7 +67,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "illuminance")
-@@ -518,7 +520,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -512,7 +520,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float illuminance = (float)atof(tmpstr.c_str());
@@ -72,7 +76,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "thermostat")
-@@ -536,7 +538,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -530,7 +538,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float temperature = (float)atof(tmpstr.c_str());
@@ -81,7 +85,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "return_water_temperature")
-@@ -545,7 +547,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -539,7 +547,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float temperature = (float)atof(tmpstr.c_str());
@@ -90,7 +94,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "boiler_temperature")
-@@ -554,7 +556,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -548,7 +556,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float temperature = (float)atof(tmpstr.c_str());
@@ -99,7 +103,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "maximum_boiler_temperature")
-@@ -563,7 +565,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -557,7 +565,7 @@ void CAnnaThermostat::GetMeterDetails()
  				if (!tmpstr.empty())
  				{
  					float temperature = (float)atof(tmpstr.c_str());
@@ -108,7 +112,7 @@ index 351f27c2f..6dfc8148c 100644
  				}
  			}
  			else if (sname == "boiler_state")
-@@ -573,11 +575,11 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -567,11 +575,11 @@ void CAnnaThermostat::GetMeterDetails()
  				{
  					if (strcmp(tmpstr.c_str(), "on") == 0)
  					{
@@ -122,7 +126,7 @@ index 351f27c2f..6dfc8148c 100644
  					}
  				}
  			}
-@@ -589,11 +591,11 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -583,11 +591,11 @@ void CAnnaThermostat::GetMeterDetails()
  					if (strcmp(tmpstr.c_str(), "on") == 0)
  					{
  
@@ -136,7 +140,7 @@ index 351f27c2f..6dfc8148c 100644
  					}
  				}
  			}
-@@ -622,11 +624,11 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -616,11 +624,11 @@ void CAnnaThermostat::GetMeterDetails()
  				{
  					if (strcmp(tmpstr.c_str(), "on") == 0)
  					{
@@ -150,7 +154,7 @@ index 351f27c2f..6dfc8148c 100644
  					}
  				}
  			}
-@@ -676,7 +678,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -670,7 +678,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float level = (float)atof(tmpstr.c_str()) * 100.F;
@@ -159,7 +163,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "central_heater_water_pressure")
-@@ -685,7 +687,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -679,7 +687,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float pressure = (float)atof(tmpstr.c_str());
@@ -168,7 +172,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "signal_strength")
-@@ -694,7 +696,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -688,7 +696,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float dbm = (float)atof(tmpstr.c_str());
@@ -177,7 +181,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "burner_starts")
-@@ -703,7 +705,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -697,7 +705,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float starts = (float)atof(tmpstr.c_str());
@@ -186,7 +190,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "failed_burner_starts")
-@@ -712,7 +714,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -706,7 +714,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float starts = (float)atof(tmpstr.c_str());
@@ -195,7 +199,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "burner_operation_time")
-@@ -721,7 +723,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -715,7 +723,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float hour = (float)atof(tmpstr.c_str());
@@ -204,7 +208,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "domestic_hot_water_burner_operation_time")
-@@ -730,7 +732,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -724,7 +732,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float hour = (float)atof(tmpstr.c_str());
@@ -213,7 +217,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "domestic_hot_water_flow")
-@@ -739,7 +741,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -733,7 +741,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float flow = (float)atof(tmpstr.c_str());
@@ -222,7 +226,7 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
              else if (sname == "domestic_hot_water_temperature")
-@@ -748,7 +750,7 @@ void CAnnaThermostat::GetMeterDetails()
+@@ -742,7 +750,7 @@ void CAnnaThermostat::GetMeterDetails()
                  if (!tmpstr.empty())
                  {
                      float temperature = (float)atof(tmpstr.c_str());
@@ -231,6 +235,3 @@ index 351f27c2f..6dfc8148c 100644
                  }
              }
          }
--- 
-2.47.3
-
