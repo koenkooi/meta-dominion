@@ -1,0 +1,36 @@
+From fdd206c66ca22133049adb9546bf5be6cd969119 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:57:36 +0200
+Subject: [PATCH 29/46] AnnaThermostat: add domestic_hot_water_comfort_mode
+ measurement
+
+Map domestic_hot_water_comfort_mode to a Domoticz switch device.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 9719c04cf..1121a5bc1 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1222,6 +1222,15 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendSwitch(applianceIDhex, 7, batterypercentage, isOn, 0, ApplianceName + " " + sname, m_Name);
+ 				}
+ 			}
++			else if (sname == "domestic_hot_water_comfort_mode")
++			{
++				if (!tmpstr.empty())
++				{
++					bool isOn = false;
++					if (isEnabledState(tmpstr, isOn))
++						SendSwitch(applianceIDhex, 12, batterypercentage, isOn, 0, ApplianceName + " " + sname, m_Name);
++				}
++			}
+ 			else if (sname == "central_heating_state")
+ 			{
+ 				if (!tmpstr.empty())

@@ -1,0 +1,134 @@
+From 1ed6f2af683efea413f96f629da748ef511f6d91 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Fri, 17 Jul 2026 17:50:23 +0200
+Subject: [PATCH 45/46] Daikin: add fault code, compressor telemetry, and
+ special-mode text
+
+Adds read-only support for fields the comparison against upstream had
+flagged as gaps (new node IDs 8/9/40/41):
+- err (from /common/basic_info) as a proper Alert-type Fault Code
+  device (green/red), mirroring the alertLevel convention already
+  used in the sibling DaikinModbus.cpp in this tree.
+- cmpfreq (Hz, unambiguous across models) as a Custom sensor,
+  Compressor Frequency.
+- mompow as a Custom sensor labeled "unverified units" rather than
+  wired into a kWh meter as Watts -- the classic protocol is
+  inconsistent across models about whether this is a real Watt
+  reading or an indexed relative-power step.
+- adv (econo/powerful/streamer) decoded to human text via a read-only
+  Text sensor, not a Selector -- the write side is a different
+  endpoint (aircon/set_special_mode, not AggregateSetControlInfo,
+  confirmed against pydaikin daikin_brp069.py source) and is not
+  implemented, so a clickable-but-inert control would be worse than
+  an honest read-only display.
+
+Also fixes a real parsing gap while adding the adv read: Domoticz own
+StringSplit(str, "=", results) drops a trailing empty token, so
+"adv=" (meaning "off") produced a 1-element vector that silently
+failed the existing size-not-equal-2 guard used for every other field
+here. Special-cased that exact token before the generic per-field
+split.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+
+Assisted-by: claude:claude-sonnet-5 [Bash] [Edit]
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/Daikin.cpp | 52 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/hardware/Daikin.cpp b/hardware/Daikin.cpp
+index 9e05c2e60..ee2ba39b5 100644
+--- a/hardware/Daikin.cpp
++++ b/hardware/Daikin.cpp
+@@ -33,10 +33,16 @@
+ //		1	vertical wings motion	20
+ //		2	horizontal wings motion	30
+ //		3	vertical and horizontal wings motion	40
++// 8  : Special Mode : decoded econo/powerful/streamer combination (adv), read-only text
++//		see docs/daikin-comparison.md #3 for the write-side (aircon/set_special_mode,
++//		not yet implemented -- it's a different endpoint than AggregateSetControlInfo)
++// 9  : Fault Code : Alert device surfacing the unit's own err= field (read-only)
+ // 10 : Outside temperature
+ // 11 : Inside temperature
+ // 12 : shum : description: represents the target humidity
+ // 20 : SetPoint
++// 40 : Compressor Frequency (Hz), from cmpfreq
++// 41 : Compressor Power (raw, unverified units -- see docs/daikin-comparison.md #1), from mompow
+ 
+ #ifdef _DEBUG
+ //#define DEBUG_DaikinR
+@@ -316,6 +322,13 @@ void CDaikin::GetBasicInfo()
+ 				UpdateSwitchNew(2, -1, (m_led[0] == '0') ? true : false, 100, "Led indicator");
+ 			}
+ 		}
++		else if (results2[0] == "err")
++		{
++			// see docs/daikin-comparison.md #2 -- previously fetched every cycle but never surfaced
++			int alertLevel = (results2[1] == "0") ? 1 : 4; // 1=Green (OK), 4=Red (fault)
++			std::string msg = (results2[1] == "0") ? "No fault" : "Fault code " + results2[1];
++			SendAlertSensor(9, 255, alertLevel, msg, "Fault Code");
++		}
+ 	}
+ }
+ 
+@@ -375,6 +388,13 @@ void CDaikin::GetControlInfo()
+ 	}
+ 	for (const auto &sVar : results)
+ 	{
++		if (sVar == "adv=")
++		{
++			// "" = no special mode active; StringSplit drops a trailing empty token so
++			// this can't reach the generic key=value split below (see docs/daikin-comparison.md #3)
++			SendTextSensor(8, 1, 255, "Off", "Special Mode");
++			continue;
++		}
+ 		std::vector<std::string> results2;
+ 		StringSplit(sVar, "=", results2);
+ 		if (results2.size() != 2)
+@@ -462,6 +482,26 @@ void CDaikin::GetControlInfo()
+ 					InsertUpdateSwitchSelector(7, true, 40, "Winds");
+ 			}
+ 		}
++		else if (results2[0] == "adv")
++		{
++			// Combination codes confirmed against pydaikin's daikin_brp069.py TRANSLATIONS
++			// table -- not a bitmask, a "/"-joined string. Write side (aircon/set_special_mode)
++			// deliberately not implemented yet, see docs/daikin-comparison.md #3.
++			std::string advName;
++			if (results2[1] == "2")
++				advName = "Powerful";
++			else if (results2[1] == "2/13")
++				advName = "Powerful+Streamer";
++			else if (results2[1] == "12")
++				advName = "Econo";
++			else if (results2[1] == "12/13")
++				advName = "Econo+Streamer";
++			else if (results2[1] == "13")
++				advName = "Streamer";
++			else
++				advName = "Unknown (" + results2[1] + ")";
++			SendTextSensor(8, 1, 255, advName, "Special Mode");
++		}
+ 		else if (results2[0] == "shum")
+ 			m_shum = results2[1];
+ 		else if (results2[0] == "dt1")
+@@ -555,6 +595,18 @@ void CDaikin::GetSensorInfo()
+ 		{
+ 			SendTempSensor(10, -1, static_cast<float>(atof(results2[1].c_str())), "Outside Temperature");
+ 		}
++		else if (results2[0] == "cmpfreq")
++		{
++			// Hz, unambiguous across models -- see docs/daikin-comparison.md #1
++			SendCustomSensor(40, 1, 255, static_cast<float>(atof(results2[1].c_str())), "Compressor Frequency", "Hz");
++		}
++		else if (results2[0] == "mompow")
++		{
++			// Daikin's classic protocol is inconsistent across models about whether this is
++			// a real Watt reading or an indexed relative-power step -- exposed as-is rather
++			// than silently trusted as absolute Watts. See docs/daikin-comparison.md #1.
++			SendCustomSensor(41, 1, 255, static_cast<float>(atof(results2[1].c_str())), "Compressor Power (unverified units)", "au");
++		}
+ 	}
+ 	if (htemp != -1)
+ 	{

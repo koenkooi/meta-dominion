@@ -15,15 +15,58 @@ SRCREV_libwebem = "0aa092796657c7007f04eca66471c164bbec7ada"
 SRCREV_FORMAT = "default_jwtcpp_libwebem"
 S = "${UNPACKDIR}/domoticz"
 
+PATCHTOOL = "git"
+
 SRC_URI = "git://github.com/domoticz/domoticz.git;protocol=https;branch=master;destsuffix=domoticz \
            git://github.com/Thalhammer/jwt-cpp.git;protocol=https;name=jwtcpp;branch=master;destsuffix=domoticz/extern/jwtcpp \
            git://github.com/domoticz/libwebem.git;protocol=https;name=libwebem;branch=master;destsuffix=domoticz/extern/libwebem \
-           file://0001-Plugwise-extract-ID-for-all-appliances-not-just-Adam.patch;patch=1 \
-           file://0002-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
-           file://0003-Plugwise-use-last-2-bytes-of-Appliance-ID-as-domotic.patch;patch=1 \
-           file://0004-Plugwise-include-appliance-name-in-sensor-name.patch;patch=1 \
-           file://0005-AnnaThermostat-add-support-for-humidity-sensors.patch;patch=1 \
-           file://0006-AnnaThermostat-add-support-for-valve_position.patch \
+           file://0001-DucoBoxSerial-add-native-hardware-plugin.patch;patch=1 \
+           file://0002-DucoBoxSerial-fix-stuck-RH-detection-cache-races-and.patch;patch=1 \
+           file://0003-DucoBoxSerial-faster-stuck-RH-detection-tighter-plau.patch;patch=1 \
+           file://0004-Plugwise-appliance-ID-extraction-and-stable-Domoticz.patch;patch=1 \
+           file://0005-Plugwise-include-appliance-name-in-sensor-name.patch;patch=1 \
+           file://0006-Pressure-allow-2-decimals-for-pressure-sensors.patch;patch=1 \
+           file://0007-Plugwise-allow-multiple-sensors-of-the-same-kind.patch;patch=1 \
+           file://0008-AnnaThermostat-add-Hub-API-v3-endpoint-fallbacks.patch;patch=1 \
+           file://0009-AnnaThermostat-add-actuator-write-routing-with-API-f.patch;patch=1 \
+           file://0010-AnnaThermostat-add-zone-thermostat-controls-and-read.patch;patch=1 \
+           file://0011-AnnaThermostat-publish-gateway-model-and-firmware.patch;patch=1 \
+           file://0012-AnnaThermostat-expose-enabled-gateway-features.patch;patch=1 \
+           file://0013-AnnaThermostat-add-generic-control-functionality-map.patch;patch=1 \
+           file://0014-AnnaThermostat-add-support-for-humidity-sensors.patch;patch=1 \
+           file://0015-AnnaThermostat-add-support-for-valve_position.patch;patch=1 \
+           file://0016-Plugwise-retrieve-and-propagate-battery-status.patch;patch=1 \
+           file://0017-AnnaThermostat-add-support-for-maximum_modulation_le.patch;patch=1 \
+           file://0018-AnnaThermostat-add-support-for-lan_state.patch;patch=1 \
+           file://0019-AnnaThermostat-add-support-for-wlan_state.patch;patch=1 \
+           file://0020-AnnaThermostat-add-support-for-intended_central_heat.patch;patch=1 \
+           file://0021-AnnaThermostat-add-support-for-domestic_hot_water_st.patch;patch=1 \
+           file://0022-AnnaThermostat-add-support-for-central_heating_state.patch;patch=1 \
+           file://0023-AnnaThermostat-add-support-for-relay-state.patch;patch=1 \
+           file://0024-AnnaThermostat-add-support-for-electricity_consumed.patch;patch=1 \
+           file://0025-AnnaThermostat-add-generic-measurement-fallback.patch;patch=1 \
+           file://0026-AnnaThermostat-prefer-direct-corrected-temperature.patch;patch=1 \
+           file://0027-AnnaThermostat-add-cooling_enabled-measurement.patch;patch=1 \
+           file://0028-AnnaThermostat-add-cooling_state-measurement.patch;patch=1 \
+           file://0029-AnnaThermostat-add-domestic_hot_water_comfort_mode-m.patch;patch=1 \
+           file://0030-AnnaThermostat-add-domestic_hot_water_setpoint-measu.patch;patch=1 \
+           file://0031-AnnaThermostat-add-electricity_produced-measurement.patch;patch=1 \
+           file://0032-AnnaThermostat-add-failed_burner_flame_ignitions-mea.patch;patch=1 \
+           file://0033-AnnaThermostat-add-gateway_mode-measurement.patch;patch=1 \
+           file://0034-AnnaThermostat-add-intended_domestic_hot_water_comfo.patch;patch=1 \
+           file://0035-AnnaThermostat-add-lan_ip_address-measurement.patch;patch=1 \
+           file://0036-AnnaThermostat-add-open_therm_power_mode-measurement.patch;patch=1 \
+           file://0037-AnnaThermostat-add-outdoor_temperature-measurement.patch;patch=1 \
+           file://0038-AnnaThermostat-add-override_mode-measurement.patch;patch=1 \
+           file://0039-AnnaThermostat-add-regulation_mode-measurement.patch;patch=1 \
+           file://0040-AnnaThermostat-add-solar_irradiance-measurement.patch;patch=1 \
+           file://0041-AnnaThermostat-add-weather_description-measurement.patch;patch=1 \
+           file://0042-AnnaThermostat-add-wind_vector-measurement.patch;patch=1 \
+           file://0043-AnnaThermostat-dedupe-point-logs-and-prefer-TempHum.patch;patch=1 \
+           file://0044-AnnaThermostat-remove-stale-maintainer-note.patch;patch=1 \
+           file://0045-Daikin-add-fault-code-compressor-telemetry-and-speci.patch;patch=1 \
+           file://0046-Daikin-track-lifetime-energy-usage-in-process-port-o.patch;patch=1 \
+           file://0001-Fix-Philips-Hue-bridge-registration-with-hidden-port.patch;patch=1 \
            file://domoticz.service \
           "
 

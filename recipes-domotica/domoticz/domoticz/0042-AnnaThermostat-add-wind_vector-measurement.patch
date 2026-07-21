@@ -1,0 +1,33 @@
+From ccf72fba48c353c7e95d5e692c72e8550a4a6c46 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 17:00:20 +0200
+Subject: [PATCH 42/46] AnnaThermostat: add wind_vector measurement
+
+Map wind_vector to a Domoticz text sensor.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 540826685..72d7785c0 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1322,6 +1322,13 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendTextSensor(applianceIDhex, 23, batterypercentage, tmpstr, ApplianceName + " " + sname);
+ 				}
+ 			}
++			else if (sname == "wind_vector")
++			{
++				if (!tmpstr.empty())
++				{
++					SendTextSensor(applianceIDhex, 24, batterypercentage, tmpstr, ApplianceName + " " + sname);
++				}
++			}
+             else if (sname == "central_heater_water_pressure")
+             {
+                 if (!tmpstr.empty())

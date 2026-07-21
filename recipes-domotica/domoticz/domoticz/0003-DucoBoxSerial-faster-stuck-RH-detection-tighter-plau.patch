@@ -1,0 +1,243 @@
+From 59cafadadeb6164abec215ff98876e88333b8651 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Fri, 17 Jul 2026 14:35:00 +0200
+Subject: [PATCH 03/46] DucoBoxSerial: faster stuck-RH detection, tighter
+ plausibility floor
+
+Confirmed live 2026-07-18 via a direct serial capture across an actual
+physical UC button press: a stuck valve raw RH sits bit-exact flat
+while the valve is also pinned near 100% airflow, and its paired
+control unit own independent RH sensor disagrees sharply (over 30
+points) while stuck, then agrees closely once the reading unsticks.
+
+Use both as corroborating signals to shorten the required flat
+duration below the baseline 20 minutes: pinned-high airflow drops it
+to 5 minutes, a disagreeing paired UC (via the network table asso
+column, newly parsed in ParseNetworkRows) drops it to 3 minutes, with
+neither weakening the existing 20-minute baseline when no
+corroborating signal is present.
+
+Also raise DUCO_MIN_HUMIDITY from 3 to 15: a known-dead sensor was
+observed producing an implausible 4% reading that the old floor let
+through as valid.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+
+Assisted-by: claude:claude-sonnet-5 [Bash] [Edit]
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/DucoBoxSerial.cpp | 90 +++++++++++++++++++++++++++++++++++---
+ hardware/DucoBoxSerial.h   | 17 ++++++-
+ 2 files changed, 99 insertions(+), 8 deletions(-)
+
+diff --git a/hardware/DucoBoxSerial.cpp b/hardware/DucoBoxSerial.cpp
+index 34ff02435..35c8a2c5b 100644
+--- a/hardware/DucoBoxSerial.cpp
++++ b/hardware/DucoBoxSerial.cpp
+@@ -43,6 +43,16 @@
+  * deterministic hash (FNV-1a/CRC32) plus a persisted collision map would make
+  * device ids stable across rebuilds; left as-is here to avoid churning existing
+  * Domoticz device mappings.
++ *
++ * Stuck-RH remediation validated live 2026-07-18: a direct serial capture across
++ * an actual physical UC button press caught a valve's raw RH bit-exact flat for
++ * the whole pre-press window (with the valve pinned at 100% airflow), and both
++ * the airflow and the raw reading resumed moving immediately after the manual
++ * overrule -- confirming NodeSetOverrule (what this plugin issues automatically)
++ * has the same unsticking effect as the physical fix. The valve's paired UC's own
++ * independent RH sensor (when one exists) agreed with the valve's reading within
++ * ~0.2 points once unstuck, having disagreed by >30 points while stuck -- see
++ * TrackAndMaybeRemediateStuckHumidity's use of hasPairedUcRh below.
+  */
+ 
+ namespace
+@@ -75,7 +85,10 @@ namespace
+ 	const int DUCO_MAX_CO2_PPM = 5000;
+ 	const float DUCO_MIN_TEMP_C = -40.0F;
+ 	const float DUCO_MAX_TEMP_C = 60.0F;
+-	const int DUCO_MIN_HUMIDITY = 3;
++	// Real indoor RH essentially never reads this low in practice (confirmed
++	// 2026-07-18: node 22's dead sensor produced an implausible 4% reading that
++	// the previous floor of 3 let straight through as "valid").
++	const int DUCO_MIN_HUMIDITY = 15;
+ 	const int DUCO_MAX_HUMIDITY = 100;
+ 
+ 	// Stuck-RH-sensor remediation (see docs/duco-api-reference.md and
+@@ -84,6 +97,17 @@ namespace
+ 	// shower-driven humidity plateaus. Deliberately no minimum-percent floor --
+ 	// a faulty valve's raw reading can latch at any level, not just a high one.
+ 	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS = 20 * 60;
++	// Shorter thresholds used when a corroborating signal is present (see
++	// TrackAndMaybeRemediateStuckHumidity) -- confirmed live 2026-07-18 that a
++	// stuck valve is reliably also pinned at ~100% airflow, and that its paired
++	// UC's own independent sensor disagrees sharply while it's stuck.
++	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS_FAST = 5 * 60;
++	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS_UC_CONFIRM = 3 * 60;
++	const int DUCO_RH_STUCK_FLOW_PINNED_PCT = 95;
++	// Observed live disagreement while genuinely stuck was >30 points (87.74%
++	// vs. 53.10%); comfortably above normal poll-to-poll/sensor-placement
++	// variation between a valve and its UC.
++	const int DUCO_RH_STUCK_UC_DISAGREEMENT_PCT = 20;
+ 	const time_t DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS = 60;
+ 	const time_t DUCO_RH_STUCK_COOLDOWN_SECONDS = 60 * 60;
+ 	const int DUCO_RH_STUCK_DEFAULT_OVERRIDE_PCT = 50;
+@@ -363,6 +387,19 @@ void CDucoBoxSerial::PollCycle()
+ 
+ 	std::set<int> seenNodes;
+ 
++	// Valve node id -> its paired UC's node id, for UCs that carry their own RH
++	// sensor and report an 'asso' pointing at the valve. Used as a corroborating
++	// signal in TrackAndMaybeRemediateStuckHumidity: the UC's independent sensor
++	// reading a materially different value than the valve is strong evidence the
++	// valve's own reading is stuck, well before the time-based threshold fires.
++	std::map<int, int> ucRhByValve;
++	for (const auto& node : nodes)
++	{
++		const std::string t = ToLower(node.type);
++		if (node.hasAsso && Contains(t, "uc") && Contains(t, "rh"))
++			ucRhByValve[node.assoNodeId] = node.nodeId;
++	}
++
+ 	for (const auto& node : nodes)
+ 	{
+ 		seenNodes.insert(node.nodeId);
+@@ -497,7 +534,15 @@ void CDucoBoxSerial::PollCycle()
+ 			int rhRaw = 0;
+ 			if (GetNodeTemperature(node, tempRaw) && ReadNodeParameter(node.nodeId, DUCO_RH_PARAGET, rhRaw))
+ 			{
+-				TrackAndMaybeRemediateStuckHumidity(node.nodeId, rhRaw);
++				const bool flowPinnedHigh = node.hasFlowPercent && node.flowPercent >= DUCO_RH_STUCK_FLOW_PINNED_PCT;
++
++				bool hasPairedUcRh = false;
++				int pairedUcRhRaw = 0;
++				const auto ucIt = ucRhByValve.find(node.nodeId);
++				if (ucIt != ucRhByValve.end())
++					hasPairedUcRh = ReadNodeParameter(ucIt->second, DUCO_RH_PARAGET, pairedUcRhRaw);
++
++				TrackAndMaybeRemediateStuckHumidity(node.nodeId, rhRaw, flowPinnedHigh, hasPairedUcRh, pairedUcRhRaw);
+ 
+ 				const float tempC = tempRaw / 10.0F;
+ 				const int humidity = (int)std::lround(rhRaw / 100.0);
+@@ -1027,7 +1072,7 @@ bool CDucoBoxSerial::WriteConfigValue(const ConfigGroup group, const int nodeId,
+ 	return true;
+ }
+ 
+-void CDucoBoxSerial::TrackAndMaybeRemediateStuckHumidity(const int nodeId, const int rhRaw)
++void CDucoBoxSerial::TrackAndMaybeRemediateStuckHumidity(const int nodeId, const int rhRaw, const bool flowPinnedHigh, const bool hasPairedUcRh, const int pairedUcRhRaw)
+ {
+ 	const time_t now = mytime(nullptr);
+ 	auto& tracker = m_rhStuckTracker[nodeId];
+@@ -1043,7 +1088,21 @@ void CDucoBoxSerial::TrackAndMaybeRemediateStuckHumidity(const int nodeId, const
+ 	const time_t stuckDuration = now - tracker.sameSince;
+ 	const int humidity = (int)std::lround(rhRaw / 100.0);
+ 
+-	if (stuckDuration < DUCO_RH_STUCK_MIN_DURATION_SECONDS)
++	// Two corroborating signals, confirmed together in a live capture on
++	// 2026-07-18: the valve pinned near-max airflow while its own reading hasn't
++	// budged (the observed failure signature), and/or its paired UC's own
++	// independent sensor reading a materially different value. Either shortens
++	// the flat-duration required to trigger well below the baseline 20 minutes.
++	const int ucRawDiff = (pairedUcRhRaw > rhRaw) ? (pairedUcRhRaw - rhRaw) : (rhRaw - pairedUcRhRaw);
++	const bool ucDisagrees = hasPairedUcRh && ucRawDiff >= (DUCO_RH_STUCK_UC_DISAGREEMENT_PCT * 100);
++
++	time_t requiredDuration = DUCO_RH_STUCK_MIN_DURATION_SECONDS;
++	if (flowPinnedHigh)
++		requiredDuration = std::min(requiredDuration, DUCO_RH_STUCK_MIN_DURATION_SECONDS_FAST);
++	if (ucDisagrees)
++		requiredDuration = std::min(requiredDuration, DUCO_RH_STUCK_MIN_DURATION_SECONDS_UC_CONFIRM);
++
++	if (stuckDuration < requiredDuration)
+ 		return;
+ 
+ 	if (m_pendingOverruleRelease.find(nodeId) != m_pendingOverruleRelease.end())
+@@ -1053,8 +1112,8 @@ void CDucoBoxSerial::TrackAndMaybeRemediateStuckHumidity(const int nodeId, const
+ 	if (cooldownIt != m_lastStuckRemediation.end() && (now - cooldownIt->second) < DUCO_RH_STUCK_COOLDOWN_SECONDS)
+ 		return;
+ 
+-	Log(LOG_ERROR, "DucoBox: node %d RH reading stuck at exactly %d%% (raw %d) for %ld min -- forcing manual override to clear it",
+-		nodeId, humidity, rhRaw, (long)(stuckDuration / 60));
++	Log(LOG_ERROR, "DucoBox: node %d RH reading stuck at exactly %d%% (raw %d) for %ld min (flowPinnedHigh=%d, ucDisagrees=%d) -- forcing manual override to clear it",
++		nodeId, humidity, rhRaw, (long)(stuckDuration / 60), (int)flowPinnedHigh, (int)ucDisagrees);
+ 
+ 	int overrideValue = DUCO_RH_STUCK_DEFAULT_OVERRIDE_PCT;
+ 	{
+@@ -1346,6 +1405,7 @@ std::vector<CDucoBoxSerial::NodeInfo> CDucoBoxSerial::ParseNetworkRows(const std
+ 	// when present to tolerate column reorderings across firmware variants.
+ 	int nodeCol = 0;
+ 	int typeCol = 2;
++	int assoCol = 6;
+ 	int statCol = 8;
+ 	int cntdwnCol = 9;
+ 	int flowCol = 10;
+@@ -1413,6 +1473,8 @@ std::vector<CDucoBoxSerial::NodeInfo> CDucoBoxSerial::ParseNetworkRows(const std
+ 					cntdwnCol = (int)idx;
+ 				else if (col == "ovrl")
+ 					ovrlCol = (int)idx;
++				else if (col == "asso")
++					assoCol = (int)idx;
+ 				else if (Contains(col, "debiet") || Contains(col, "flow") || Contains(col, "airflow"))
+ 					flowCol = (int)idx;
+ 			}
+@@ -1444,6 +1506,22 @@ std::vector<CDucoBoxSerial::NodeInfo> CDucoBoxSerial::ParseNetworkRows(const std
+ 			}
+ 		}
+ 
++		if ((size_t)assoCol < fields.size())
++		{
++			std::smatch assoMatch;
++			if (std::regex_search(fields[assoCol], assoMatch, std::regex("^\\s*(-?[0-9]+)")) && assoMatch.size() > 1)
++			{
++				try
++				{
++					n.assoNodeId = std::stoi(assoMatch[1].str());
++					n.hasAsso = true;
++				}
++				catch (...)
++				{
++				}
++			}
++		}
++
+ 		if ((size_t)tempCol < fields.size())
+ 		{
+ 			// A bare '-' (no sensor at all, e.g. SWITCH nodes) simply won't match
+diff --git a/hardware/DucoBoxSerial.h b/hardware/DucoBoxSerial.h
+index cd0f0cabc..424f3dfd3 100644
+--- a/hardware/DucoBoxSerial.h
++++ b/hardware/DucoBoxSerial.h
+@@ -43,6 +43,11 @@ private:
+ 		int cntdwnRaw = 0; // seconds, ~1/sec countdown observed live
+ 		bool hasOvrl = false;
+ 		int ovrlRaw = 0; // 255 == no explicit override active
++		// The network row's 'asso' (association) column: for a UC node with its
++		// own RH/CO2 sensor, this is the valve node it's paired with -- used to
++		// cross-check a valve's RH reading against its UC's independent sensor.
++		bool hasAsso = false;
++		int assoNodeId = 0;
+ 	};
+ 
+ 	struct SensorProbeResult
+@@ -110,13 +115,21 @@ private:
+ 	void PublishNodeConfig(int nodeId);
+ 	void PublishBoxVentCtrl();
+ 
+-	// Hardware workaround: some RH sensors occasionally latch onto a high reading
++	// Hardware workaround: some RH sensors occasionally latch onto a reading
+ 	// (observed: exactly unchanged across many consecutive polls) which then drives
+ 	// the fan to max fighting a phantom humidity level. A physical UC button press
+ 	// (forcing manual mode, then letting it time out back to Auto) is known to clear
+ 	// it; these replicate that over the serial protocol. See docs/duco-api-reference.md.
++	// Confirmed live 2026-07-18 via direct serial capture across an actual button
++	// press: raw RH bit-exact flat with the valve pinned at 100% airflow, then both
++	// the airflow and the raw reading moved again immediately after the overrule.
+ 	void CheckPendingOverruleReleases();
+-	void TrackAndMaybeRemediateStuckHumidity(int nodeId, int rhRaw);
++	// flowPinnedHigh: this valve's own airflow%% is currently pinned near max (the
++	// observed failure signature); hasPairedUcRh/pairedUcRhRaw: this valve's
++	// associated UC's own independent RH reading, when one exists. Either
++	// corroborating signal shortens the flat-duration required to trigger --
++	// see the constants and comment where they're used.
++	void TrackAndMaybeRemediateStuckHumidity(int nodeId, int rhRaw, bool flowPinnedHigh, bool hasPairedUcRh, int pairedUcRhRaw);
+ 	bool IssueNodeOverrule(int nodeId, int value);
+ 	void PublishConfigParam(int nodeId, ConfigGroup group, const ConfigParam& p);
+ 	bool WriteConfigValue(ConfigGroup group, int nodeId, int index, int value);
