@@ -47,6 +47,7 @@ CORE_IMAGE_EXTRA_INSTALL += " \
 	libgpiod-tools \
 	gpsd pps-tools gps-utils chrony setserial \
 	dracut \
+	grow-rootfs \
 "
 
 export IMAGE_BASENAME = "Domoticz-image"
