@@ -16,7 +16,7 @@ IMAGE_FEATURES += "package-management nfs-client ssh-server-openssh"
 
 CORE_IMAGE_EXTRA_INSTALL += " \
 	domoticz \
-	${ROOTFS_PKGMANAGE_PKGS} \
+	${ROOTFS_PKGMANAGE_PKGS} ${DISTROFEEDCONFIGS} \
 	systemd-zram-generator systemd-boot \
 	bash tar wget curl screen rsync procps pigz \
 	openssh-ssh openssh-scp openssh-sftp \
