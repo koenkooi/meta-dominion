@@ -1,0 +1,79 @@
+From 9d3fdad2cf69b223ecfd9ac5555c0ffc53609445 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Fri, 8 Jan 2021 13:58:55 +0100
+Subject: [PATCH 04/50] Pressure: allow 2 decimals for pressure sensors
+
+Plugwise Adam reports boiler pressure in 2 decimals, e.g. 1.53 bar, but
+domoticz internally lops off the second decimal. To make it worse,
+SQLHelper them drops *all* decimals.
+
+In the context of Plugwise, the difference between '2.49' and '2.00' is
+significant, presenting and storing both as '2' is very misleading. I
+noticed this when wanting to use Domoticz to see if the repair to the
+leak in the central heating was successful.
+
+Increase precision by one decimal everywhere: "%.2f", except for
+SQLHelper, that changes to "%.1f".
+
+The net result is that data push to e.g. InfluxDB will have actually
+useful values.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Upstream-Status: Submitted [https://github.com/domoticz/domoticz/pull/6317]
+---
+ main/SQLHelper.cpp  | 2 +-
+ main/WebServer.cpp  | 2 +-
+ main/mainworker.cpp | 4 ++--
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/main/SQLHelper.cpp b/main/SQLHelper.cpp
+index c9eda7ae9..e1bcd1e2f 100644
+--- a/main/SQLHelper.cpp
++++ b/main/SQLHelper.cpp
+@@ -7374,7 +7374,7 @@ void CSQLHelper::UpdateMeter()
+ 			else if ((dType == pTypeGeneral) && (dSubType == sTypePressure))
+ 			{
+ 				double fValue = atof(sValue.c_str()) * 10.0F;
+-				sprintf(szTmp, "%.0f", fValue);
++				sprintf(szTmp, "%.1f", fValue);
+ 				sValue = szTmp;
+ 			}
+ 			else if (dType == pTypeUsage)
+diff --git a/main/WebServer.cpp b/main/WebServer.cpp
+index 031650926..e56eacd0f 100644
+--- a/main/WebServer.cpp
++++ b/main/WebServer.cpp
+@@ -3711,7 +3711,7 @@ namespace http
+ 						}
+ 						else if (dSubType == sTypePressure)
+ 						{
+-							sprintf(szData, "%.1f Bar", atof(sValue.c_str()));
++							sprintf(szData, "%.2f Bar", atof(sValue.c_str()));
+ 							root["result"][ii]["Data"] = szData;
+ 							root["result"][ii]["TypeImg"] = "gauge";
+ 							root["result"][ii]["HaveTimeout"] = bHaveTimeout;
+diff --git a/main/mainworker.cpp b/main/mainworker.cpp
+index 500b76ab9..8239cb1f1 100644
+--- a/main/mainworker.cpp
++++ b/main/mainworker.cpp
+@@ -10434,7 +10434,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
+ 	}
+ 	else if (subType == sTypePressure)
+ 	{
+-		sprintf(szTmp, "%.1f", pMeter->floatval1);
++		sprintf(szTmp, "%.2f", pMeter->floatval1);
+ 		DevRowIdx = m_sql.UpdateValue(pHardware->m_HwdID, 0, ID.c_str(), Unit, devType, subType, SignalLevel, BatteryLevel, cmnd, szTmp, procResult.DeviceName, true, procResult.Username.c_str());
+ 		if (DevRowIdx == (uint64_t)-1)
+ 			return;
+@@ -10561,7 +10561,7 @@ void MainWorker::decode_General(const CDomoticzHardwareBase* pHardware, const tR
+ 			break;
+ 		case sTypePressure:
+ 			WriteMessage("subtype       = Pressure");
+-			sprintf(szTmp, "Pressure = %.1f bar", pMeter->floatval1);
++			sprintf(szTmp, "Pressure = %.2f bar", pMeter->floatval1);
+ 			WriteMessage(szTmp);
+ 			break;
+ 		case sTypeBaro:
+-- 
+2.51.0
+

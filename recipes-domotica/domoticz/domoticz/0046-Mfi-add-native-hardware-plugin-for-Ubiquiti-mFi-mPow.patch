@@ -1,0 +1,638 @@
+From ce0008a43af42881a83e84249dea7b5b03873a83 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sun, 26 Jul 2026 11:58:31 +0200
+Subject: [PATCH 46/50] Mfi: add native hardware plugin for Ubiquiti mFi/mPower
+
+Polls the device's local JSON API over a cookie session and publishes, per
+port, a kWh meter, an On/Off switch and a load-detection alert; THS probes get
+a temperature sensor instead. Writes are read back to confirm.
+
+The session cookie goes out as an explicit header rather than through the
+process-wide cookie jar, so more than one device can be configured at once.
+
+Two quirks of firmware 2.1, both confirmed against the vendor's own CGI
+source. The API no longer carries an energy field, only per-calendar-month
+counters, so the lifetime total is accumulated from month-to-month deltas and
+handles the rollover. The enabled field is a driver-level flag that reads 0
+even on a port drawing current, so load detection uses power and current
+thresholds rather than trusting it.
+
+Note the hardware's own energy counter reads zero on some units despite real
+draw, which leaves the kWh total at zero through no fault of this code.
+
+Upstream-Status: Inappropriate [WIP]
+---
+ CMakeLists.txt         |   1 +
+ hardware/Mfi.cpp       | 427 +++++++++++++++++++++++++++++++++++++++++
+ hardware/Mfi.h         |  90 +++++++++
+ main/RFXNames.cpp      |   1 +
+ main/RFXNames.h        |   1 +
+ main/WebServerCmds.cpp |   2 +-
+ main/mainworker.cpp    |   4 +
+ 7 files changed, 525 insertions(+), 1 deletion(-)
+ create mode 100644 hardware/Mfi.cpp
+ create mode 100644 hardware/Mfi.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8eae462fc..431944ad9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -309,6 +309,7 @@ hardware/LogitechMediaServer.cpp
+ hardware/Matter.cpp
+ hardware/Meteorologisk.cpp
+ hardware/Meteostick.cpp
++hardware/Mfi.cpp
+ hardware/MitsubishiWF.cpp
+ hardware/MochadTCP.cpp
+ hardware/MQTT.cpp
+diff --git a/hardware/Mfi.cpp b/hardware/Mfi.cpp
+new file mode 100644
+index 000000000..b2ddb29d5
+--- /dev/null
++++ b/hardware/Mfi.cpp
+@@ -0,0 +1,427 @@
++#include "stdafx.h"
++#include "Mfi.h"
++#include "../main/Helper.h"
++#include "../main/Logger.h"
++#include "../main/json_helper.h"
++#include "../main/SQLHelper.h"
++#include "../httpclient/HTTPClient.h"
++#include "hardwaretypes.h"
++#include <sstream>
++
++// mFi's local JSON API. Originally designed against two independent
++// reference clients (acedrew/ubnt-mfi-py, uilibs/mficlient) and a packet
++// capture (chorankates/h4ck) documenting firmware 2.0.8 -- see
++// docs/mfi-native-integration-scoping.md in the ducobox project. CONFIRMED
++// live 2026-07-19 against 3 real devices on this fleet (firmware 2.1.11),
++// which corrected one real schema drift (noted inline below):
++//
++//   GET  /                  -- primes an initial session cookie
++//   POST /login.cgi         -- multipart/form-data: uri, username, password,
++//                              Submit=Login; success sets AIROS_SESSIONID
++//   GET  /mfi/sensors.cgi   -- {"sensors":[{port,output,power,voltage,
++//                              current,powerfactor,relay,lock,enabled,
++//                              prevmonth,thismonth}, ...],"status":"success"}
++//                              NO "energy" field on this firmware (unlike
++//                              2.0.8's documented schema) -- prevmonth/
++//                              thismonth are calendar-month kWh buckets,
++//                              not a lifetime total; see
++//                              AccumulateMonthlyKwh for why/how this plugin
++//                              turns that into Domoticz's expected
++//                              monotonically-increasing kWh total.
++//                              An mFi-THS temperature probe instead reports
++//                              "analog" and model:"Ubiquiti mFi-THS";
++//                              tempC = analog * 30 - 10 (linear calibration
++//                              from acedrew's client, specific to that probe;
++//                              NOT independently re-verified live -- no THS
++//                              probe was in the reconnaissance fleet).
++//   PUT  /sensors/<port>/   -- body "output=0|1"
++
++#define MFI_POLL_INTERVAL_SECONDS 30
++
++// Load-detection heuristic thresholds. Not derived from a confirmed
++// true-negative sample (an empty socket) on this fleet -- picked
++// conservatively (most always-on standby electronics draw at least this
++// much; an empty socket reads ~0.000) and documented as tunable rather than
++// authoritative. Re-check against a real empty-vs-loaded pair if this ever
++// misfires in practice.
++#define MFI_LOAD_DETECT_WATTS 1.0
++#define MFI_LOAD_DETECT_AMPS 0.02
++#define MFI_MAX_CONSECUTIVE_FAILURES_LOGGED 3
++
++CMfi::CMfi(const int ID, const std::string &IPAddress, const unsigned short usIPPort, const std::string &username, const std::string &password)
++	: m_szIPAddress(IPAddress)
++	, m_usIPPort(usIPPort)
++	, m_Username(username.empty() ? "ubnt" : username)
++	, m_Password(password.empty() ? "ubnt" : password)
++{
++	m_HwdID = ID;
++	m_bOutputLog = false;
++}
++
++bool CMfi::StartHardware()
++{
++	RequestStart();
++
++	m_thread = std::make_shared<std::thread>([this] { Do_Work(); });
++	SetThreadNameInt(m_thread->native_handle());
++	m_bIsStarted = true;
++	sOnConnected(this);
++	return (m_thread != nullptr);
++}
++
++bool CMfi::StopHardware()
++{
++	if (m_thread)
++	{
++		RequestStop();
++		m_thread->join();
++		m_thread.reset();
++	}
++	m_bIsStarted = false;
++	return true;
++}
++
++void CMfi::Do_Work()
++{
++	int sec_counter = MFI_POLL_INTERVAL_SECONDS - 2; // trigger shortly after startup, matching Daikin/AlfenEve convention
++
++	Log(LOG_STATUS, "mFi: Worker started for %s ...", m_szIPAddress.c_str());
++	while (!IsStopRequested(1000))
++	{
++		sec_counter++;
++
++		if (sec_counter % 12 == 0)
++		{
++			m_LastHeartbeat = mytime(nullptr);
++		}
++
++		if (sec_counter % MFI_POLL_INTERVAL_SECONDS == 0)
++		{
++			Json::Value sensors;
++			if (PollSensors(sensors))
++			{
++				m_consecutiveFailures = 0;
++				ProcessSensors(sensors);
++			}
++			else
++			{
++				m_consecutiveFailures++;
++				if (m_consecutiveFailures <= MFI_MAX_CONSECUTIVE_FAILURES_LOGGED)
++				{
++					Log(LOG_ERROR, "mFi: could not read sensors from %s (failure #%d)", m_szIPAddress.c_str(), m_consecutiveFailures);
++				}
++			}
++		}
++	}
++	Log(LOG_STATUS, "mFi: Worker stopped for %s ...", m_szIPAddress.c_str());
++}
++
++std::string CMfi::BuildUrl(const std::string &path) const
++{
++	std::stringstream sURL;
++	sURL << "http://" << m_szIPAddress << ":" << m_usIPPort << path;
++	return sURL.str();
++}
++
++std::vector<std::string> CMfi::BuildCookieHeader() const
++{
++	std::vector<std::string> headers;
++	if (!m_SessionCookie.empty())
++	{
++		headers.push_back("Cookie: " + m_SessionCookie);
++	}
++	return headers;
++}
++
++bool CMfi::Login()
++{
++	// Prime an initial session cookie the way the reference client does
++	// before posting credentials.
++	std::string sPrimeResult;
++	std::vector<std::string> primeHeaders;
++	HTTPClient::GET(BuildUrl("/"), {}, sPrimeResult, primeHeaders, true);
++
++	std::string sPrimeCookie;
++	for (const auto &line : primeHeaders)
++	{
++		auto pos = line.find("Set-Cookie:");
++		if (pos == std::string::npos)
++			pos = line.find("set-cookie:");
++		if (pos != std::string::npos)
++		{
++			std::string sCookieLine = line.substr(pos + strlen("Set-Cookie:"));
++			auto semi = sCookieLine.find(';');
++			if (semi != std::string::npos)
++				sCookieLine = sCookieLine.substr(0, semi);
++			sPrimeCookie = stdstring_trimws(sCookieLine);
++		}
++	}
++
++	const std::string boundary = "----DomoticzMfi" + std::to_string(mytime(nullptr));
++	std::stringstream sBody;
++	auto addField = [&sBody, &boundary](const std::string &name, const std::string &value) {
++		sBody << "--" << boundary << "\r\nContent-Disposition: form-data; name=\"" << name << "\"\r\n\r\n" << value << "\r\n";
++	};
++	addField("uri", "/");
++	addField("username", m_Username);
++	addField("password", m_Password);
++	addField("Submit", "Login");
++	sBody << "--" << boundary << "--\r\n";
++
++	std::vector<std::string> requestHeaders;
++	requestHeaders.push_back("Content-Type: multipart/form-data; boundary=" + boundary);
++	if (!sPrimeCookie.empty())
++		requestHeaders.push_back("Cookie: " + sPrimeCookie);
++
++	std::string sResult;
++	std::vector<std::string> responseHeaders;
++	// bFollowRedirect=false -- login success is itself a 302; we need to see
++	// its own Set-Cookie header, not the page it redirects to.
++	HTTPClient::POST(BuildUrl("/login.cgi"), sBody.str(), requestHeaders, sResult, responseHeaders, false);
++
++	std::string sSessionId;
++	for (const auto &line : responseHeaders)
++	{
++		if (line.find("AIROS_SESSIONID") == std::string::npos)
++			continue;
++		auto pos = line.find("AIROS_SESSIONID=");
++		if (pos == std::string::npos)
++			continue;
++		std::string sCookieLine = line.substr(pos);
++		auto semi = sCookieLine.find(';');
++		if (semi != std::string::npos)
++			sCookieLine = sCookieLine.substr(0, semi);
++		sSessionId = stdstring_trimws(sCookieLine);
++	}
++
++	std::lock_guard<std::mutex> lock(m_sessionMutex);
++	if (sSessionId.empty())
++	{
++		m_bLoggedIn = false;
++		Log(LOG_ERROR, "mFi: login to %s failed -- check username/password", m_szIPAddress.c_str());
++		return false;
++	}
++	m_SessionCookie = sSessionId;
++	m_bLoggedIn = true;
++	return true;
++}
++
++bool CMfi::PollSensors(Json::Value &sensorsOut)
++{
++	if (!m_bLoggedIn && !Login())
++		return false;
++
++	std::string sResult;
++	if (!HTTPClient::GET(BuildUrl("/mfi/sensors.cgi"), BuildCookieHeader(), sResult))
++	{
++		Log(LOG_ERROR, "mFi: error connecting to %s", m_szIPAddress.c_str());
++		return false;
++	}
++
++	auto looksLikeSensorsJson = [](const std::string &body) { return body.find("\"sensors\"") != std::string::npos; };
++
++	if (!looksLikeSensorsJson(sResult))
++	{
++		// Session likely expired (redirected to the login page) -- re-auth once and retry.
++		{
++			std::lock_guard<std::mutex> lock(m_sessionMutex);
++			m_bLoggedIn = false;
++		}
++		if (!Login())
++			return false;
++		if (!HTTPClient::GET(BuildUrl("/mfi/sensors.cgi"), BuildCookieHeader(), sResult))
++		{
++			Log(LOG_ERROR, "mFi: error connecting to %s", m_szIPAddress.c_str());
++			return false;
++		}
++		if (!looksLikeSensorsJson(sResult))
++		{
++			Log(LOG_ERROR, "mFi: unexpected /mfi/sensors.cgi response from %s", m_szIPAddress.c_str());
++			return false;
++		}
++	}
++
++	Json::Value root;
++	if (!ParseJSon(sResult, root) || !root.isMember("sensors") || !root["sensors"].isArray())
++	{
++		Log(LOG_ERROR, "mFi: invalid JSON from %s", m_szIPAddress.c_str());
++		return false;
++	}
++	if (root["status"].asString() != "success")
++	{
++		Log(LOG_ERROR, "mFi: %s returned status=%s", m_szIPAddress.c_str(), root["status"].asString().c_str());
++		return false;
++	}
++	sensorsOut = root["sensors"];
++	return true;
++}
++
++void CMfi::ProcessSensors(const Json::Value &sensors)
++{
++	for (const auto &sensor : sensors)
++	{
++		if (!sensor.isMember("port"))
++			continue;
++		int port = sensor["port"].asInt();
++
++		// mFi-THS temperature probes report a different shape (analog +
++		// model) than a normal relay/power outlet -- dispatch on that
++		// rather than assuming every port is an outlet.
++		std::string model = sensor.isMember("model") ? sensor["model"].asString() : "";
++		if (sensor.isMember("analog") && model.find("THS") != std::string::npos)
++			ProcessTempProbe(sensor, port);
++		else
++			ProcessOutletPort(sensor, port);
++	}
++}
++
++void CMfi::ProcessOutletPort(const Json::Value &sensor, int port)
++{
++	double power = sensor.isMember("power") ? sensor["power"].asDouble() : 0;
++	double current = sensor.isMember("current") ? sensor["current"].asDouble() : 0;
++	// CONFIRMED live 2026-07-19 against 3 real devices: firmware 2.1.11 has
++	// NO "energy" field at all (the documented/reference-client schema was
++	// for 2.0.8) -- only "thismonth"/"prevmonth" calendar-month kWh
++	// buckets. Turn that into the monotonically-increasing lifetime total
++	// Domoticz's kWh device expects.
++	double thisMonthKwh = sensor.isMember("thismonth") ? sensor["thismonth"].asDouble() : 0;
++	double lifetimeKwh = AccumulateMonthlyKwh(port, thisMonthKwh);
++	bool bOn = sensor.isMember("output") && sensor["output"].asInt() != 0;
++
++	std::string sName = "mFi port " + std::to_string(port);
++	SendKwhMeter(port, port, 255, power, lifetimeKwh, sName + " usage");
++	SendSwitch(port, port, 255, bOn, 0, sName, m_Name);
++
++	bool bLoadDetected = DetectLoad(bOn, power, current);
++	SendAlertSensor(port, 255, bLoadDetected ? 1 : 0, bLoadDetected ? "Load detected" : "No load detected", sName + " load");
++
++	// Surface the device's own lock state rather than only checking HTTP
++	// success -- a locked port can't actually be toggled even though a PUT
++	// to it may still return 2xx.
++	if (sensor.isMember("lock") && sensor["lock"].asInt() != 0)
++	{
++		Log(LOG_STATUS, "mFi: %s port %d is locked (output cannot be changed)", m_szIPAddress.c_str(), port);
++	}
++}
++
++bool CMfi::DetectLoad(bool bOn, double power, double current) const
++{
++	// Can't tell anything while the relay is open -- no current can flow
++	// regardless of what's plugged in, so this reports "no load" rather
++	// than a genuine "confirmed empty" claim.
++	if (!bOn)
++		return false;
++	return (power > MFI_LOAD_DETECT_WATTS) || (current > MFI_LOAD_DETECT_AMPS);
++}
++
++double CMfi::AccumulateMonthlyKwh(int port, double thisMonthKwh)
++{
++	if (!m_kwhRestored[port])
++	{
++		m_kwhRestored[port] = true;
++		char szTmp[20];
++		sprintf(szTmp, "%08X", (unsigned int)((port << 8) | port));
++		int nValue;
++		std::string sValue;
++		struct tm lastUpdate {
++		};
++		if (m_sql.GetLastValue(m_HwdID, szTmp, 1, pTypeGeneral, sTypeKwh, nValue, sValue, lastUpdate))
++		{
++			std::vector<std::string> parts;
++			StringSplit(sValue, ";", parts);
++			if (parts.size() == 2)
++				m_accumulatedKwh[port] = atof(parts[1].c_str()) / 1000.0; // stored in Wh, tracked here in kWh
++		}
++		m_lastThisMonthKwh[port] = thisMonthKwh;
++		return m_accumulatedKwh[port];
++	}
++
++	double delta;
++	if (thisMonthKwh >= m_lastThisMonthKwh[port])
++	{
++		delta = thisMonthKwh - m_lastThisMonthKwh[port];
++	}
++	else
++	{
++		// thismonth dropped -- a new calendar month started and the device
++		// reset its own bucket. The new (lower) value is this month's usage
++		// so far in its entirety, not a negative delta against last month.
++		delta = thisMonthKwh;
++	}
++	m_lastThisMonthKwh[port] = thisMonthKwh;
++	m_accumulatedKwh[port] += delta;
++	return m_accumulatedKwh[port];
++}
++
++void CMfi::ProcessTempProbe(const Json::Value &sensor, int port)
++{
++	if (!sensor.isMember("analog"))
++		return;
++	double analog = sensor["analog"].asDouble();
++	float tempC = static_cast<float>(analog * 30 - 10);
++	SendTempSensor(port, 255, tempC, "mFi temp probe " + std::to_string(port));
++}
++
++bool CMfi::SetOutput(int port, bool bOn)
++{
++	if (!m_bLoggedIn && !Login())
++		return false;
++
++	std::string sBody = std::string("output=") + (bOn ? "1" : "0");
++	std::vector<std::string> headers = BuildCookieHeader();
++	headers.push_back("Content-Type: application/x-www-form-urlencoded");
++
++	std::string sResult;
++	std::string sUrl = BuildUrl("/sensors/" + std::to_string(port) + "/");
++	if (!HTTPClient::PUT(sUrl, sBody, headers, sResult, true))
++	{
++		// Session may have expired -- re-login once and retry.
++		{
++			std::lock_guard<std::mutex> lock(m_sessionMutex);
++			m_bLoggedIn = false;
++		}
++		if (!Login())
++			return false;
++		headers = BuildCookieHeader();
++		headers.push_back("Content-Type: application/x-www-form-urlencoded");
++		if (!HTTPClient::PUT(sUrl, sBody, headers, sResult, true))
++		{
++			Log(LOG_ERROR, "mFi: PUT /sensors/%d/ on %s failed", port, m_szIPAddress.c_str());
++			return false;
++		}
++	}
++
++	// Don't trust a bare success reply -- read the port back and confirm the
++	// output actually changed, same discipline already applied elsewhere in
++	// this fork's own valve-overrule work.
++	Json::Value sensors;
++	if (!PollSensors(sensors))
++		return false;
++	for (const auto &sensor : sensors)
++	{
++		if (!sensor.isMember("port") || sensor["port"].asInt() != port)
++			continue;
++		bool bConfirmedOn = sensor.isMember("output") && sensor["output"].asInt() != 0;
++		if (bConfirmedOn != bOn)
++		{
++			Log(LOG_ERROR, "mFi: %s port %d did not confirm requested state (wanted %s, read back %s)", m_szIPAddress.c_str(), port, bOn ? "on" : "off", bConfirmedOn ? "on" : "off");
++			return false;
++		}
++		ProcessSensors(sensors);
++		return true;
++	}
++	Log(LOG_ERROR, "mFi: %s port %d missing from sensor list after write", m_szIPAddress.c_str(), port);
++	return false;
++}
++
++bool CMfi::WriteToHardware(const char *pdata, unsigned char /*length*/)
++{
++	const tRBUF *pCmd = reinterpret_cast<const tRBUF *>(pdata);
++	if (pCmd->ICMND.packettype != pTypeGeneralSwitch)
++		return false;
++
++	const _tGeneralSwitch *pSwitch = reinterpret_cast<const _tGeneralSwitch *>(pdata);
++	int port = pSwitch->unitcode;
++	bool bOn = pSwitch->cmnd == gswitch_sOn;
++	return SetOutput(port, bOn);
++}
+diff --git a/hardware/Mfi.h b/hardware/Mfi.h
+new file mode 100644
+index 000000000..650f5010b
+--- /dev/null
++++ b/hardware/Mfi.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++#include "DomoticzHardware.h"
++#include <json/json.h>
++#include <map>
++#include <mutex>
++
++// Native Domoticz hardware plugin for Ubiquiti mFi/mPower devices (mPower
++// strips, mFi switches). One hardware instance per physical device, one
++// Domoticz child device pair (kWh meter + On/Off switch) per relay port, or
++// a single temperature sensor for an mFi-THS probe. See
++// docs/mfi-native-integration-scoping.md (ducobox project) for the API
++// research this is built from.
++//
++// Schema CONFIRMED live 2026-07-19 against 3 real devices on this fleet
++// (firmware 2.1.11): matches the documented/reference-client schema for
++// power/current/voltage/powerfactor/relay/lock, but there is NO "energy"
++// field at all -- instead "prevmonth"/"thismonth" (calendar-month kWh
++// buckets, not a device-side running lifetime total, and a new "enabled"
++// field not in any reference source). Since Domoticz's kWh device wants a
++// monotonically-increasing lifetime total, this plugin accumulates its own
++// running total from thismonth's poll-to-poll deltas (see
++// m_lastThisMonthKwh/m_accumulatedKwh), the same pattern already used for
++// Daikin's usage.sh port -- NOT a straight passthrough like the
++// (incorrect, pre-2026-07-19) assumption that "energy" was already a
++// lifetime total.
++class CMfi : public CDomoticzHardwareBase
++{
++      public:
++	CMfi(int ID, const std::string &IPAddress, unsigned short usIPPort, const std::string &username, const std::string &password);
++	~CMfi() override = default;
++
++	bool WriteToHardware(const char *pdata, unsigned char length) override;
++
++      private:
++	bool StartHardware() override;
++	bool StopHardware() override;
++	void Do_Work();
++
++	// Session handling. mFi's login is a cookie-based web session, not HTTP
++	// Basic Auth -- capture AIROS_SESSIONID from the login response and pass
++	// it explicitly as a Cookie header on every subsequent request, rather
++	// than relying on Domoticz's process-wide shared cookie jar (HTTPClient's
++	// CURLOPT_COOKIEFILE), which would be a concurrency risk shared across
++	// every mFi hardware instance in the fleet.
++	bool Login();
++	std::string BuildUrl(const std::string &path) const;
++	std::vector<std::string> BuildCookieHeader() const;
++
++	// Poll /mfi/sensors.cgi, re-login once on an expired/redirected session.
++	bool PollSensors(Json::Value &sensorsOut);
++	void ProcessSensors(const Json::Value &sensors);
++	void ProcessOutletPort(const Json::Value &sensor, int port);
++	void ProcessTempProbe(const Json::Value &sensor, int port);
++
++	// Turns this firmware's calendar-month "thismonth" kWh bucket into a
++	// monotonically-increasing lifetime total for Domoticz's kWh device.
++	// Seeds from the device's own last stored value on first use per port
++	// (survives Domoticz's nightly restart), same spirit as Daikin's
++	// RestoreUsageTotals.
++	double AccumulateMonthlyKwh(int port, double thisMonthKwh);
++
++	// Heuristic "is something actually plugged in and drawing power on this
++	// switched-on port" indicator. mFi's own "enabled" field does NOT track
++	// this (confirmed live 2026-07-19: it read 0 on every real port
++	// checked, including ones drawing 100+ W) -- so this is a plain
++	// power/current threshold heuristic, not a device-reported fact. See
++	// MFI_LOAD_DETECT_WATTS/_AMPS.
++	bool DetectLoad(bool bOn, double power, double current) const;
++
++	// PUT /sensors/<port>/ with output=0|1, then read back to confirm rather
++	// than trusting a bare HTTP success (same discipline already applied to
++	// DucoBox valve overrules).
++	bool SetOutput(int port, bool bOn);
++
++	std::string m_szIPAddress;
++	unsigned short m_usIPPort;
++	std::string m_Username;
++	std::string m_Password;
++	std::string m_SessionCookie; // e.g. "AIROS_SESSIONID=abcdef"
++	bool m_bLoggedIn = false;
++	int m_consecutiveFailures = 0;
++	std::shared_ptr<std::thread> m_thread;
++	std::mutex m_sessionMutex; // guards m_SessionCookie/m_bLoggedIn: Do_Work polls and WriteToHardware writes can run concurrently
++
++	// Per-port kWh accumulation state (see AccumulateMonthlyKwh).
++	std::map<int, double> m_lastThisMonthKwh;
++	std::map<int, double> m_accumulatedKwh;
++	std::map<int, bool> m_kwhRestored;
++};
+diff --git a/main/RFXNames.cpp b/main/RFXNames.cpp
+index af9c7d5fc..77954cef6 100755
+--- a/main/RFXNames.cpp
++++ b/main/RFXNames.cpp
+@@ -282,6 +282,7 @@ static const STR_TABLE_SINGLE HardwareTypeTable[] = {
+ 	{ HTYPE_OpenMeteo, "Open-Meteo (Weather Lookup)", "OpenMeteo" },
+ 	{ HTYPE_Matter, "Matter (python-matterjs-server)", "Matter" },
+ 	{ HTYPE_DucoBoxSerial, "DucoBox Serial USB", "DucoBox" },
++	{ HTYPE_Mfi, "Ubiquiti mFi/mPower LAN (HTTP) interface", "mFi" },
+ 	{ 0, nullptr, nullptr },
+ };
+ 
+diff --git a/main/RFXNames.h b/main/RFXNames.h
+index 03a4d8e5a..7d15130f8 100644
+--- a/main/RFXNames.h
++++ b/main/RFXNames.h
+@@ -226,6 +226,7 @@ enum _eHardwareTypes {
+ 	HTYPE_MitsubishiWF,			//128
+ 	HTYPE_Matter,				//129
+ 	HTYPE_DucoBoxSerial,		//130
++	HTYPE_Mfi,					//131
+ 	HTYPE_END
+ };
+ 
+diff --git a/main/WebServerCmds.cpp b/main/WebServerCmds.cpp
+index 2650753d3..398cd661e 100644
+--- a/main/WebServerCmds.cpp
++++ b/main/WebServerCmds.cpp
+@@ -1553,7 +1553,7 @@ namespace http
+ 					|| (htype == HTYPE_Arilux) || (htype == HTYPE_USBtinGateway) || (htype == HTYPE_BuienRadar) || (htype == HTYPE_Honeywell) ||(htype == HTYPE_RaspberryGPIO)
+ 					|| (htype == HTYPE_SysfsGpio) || (htype == HTYPE_OpenWebNetTCP) || (htype == HTYPE_Daikin) || (htype == HTYPE_DaikinModbus) || (htype == HTYPE_PythonPlugin) || (htype == HTYPE_RaspberryPCF8574)
+ 					|| (htype == HTYPE_OpenWebNetUSB) || (htype == HTYPE_IntergasInComfortLAN2RF) || (htype == HTYPE_EnphaseAPI) || (htype == HTYPE_EcoCompteur) || (htype == HTYPE_Meteorologisk) || (htype == HTYPE_OpenMeteo)
+-					|| (htype == HTYPE_AirconWithMe) || (htype == HTYPE_EneverPriceFeeds) || (htype == HTYPE_Tado) || (htype == HTYPE_Matter))
++					|| (htype == HTYPE_AirconWithMe) || (htype == HTYPE_EneverPriceFeeds) || (htype == HTYPE_Tado) || (htype == HTYPE_Matter) || (htype == HTYPE_Mfi))
+ 			{
+ 				return true;
+ 			}
+diff --git a/main/mainworker.cpp b/main/mainworker.cpp
+index 8239cb1f1..8fb39bc6d 100644
+--- a/main/mainworker.cpp
++++ b/main/mainworker.cpp
+@@ -122,6 +122,7 @@
+ #include "../hardware/DenkoviUSBDevices.h"
+ #include "../hardware/DenkoviTCPDevices.h"
+ #include "../hardware/DucoBoxSerial.h"
++#include "../hardware/Mfi.h"
+ #include "../hardware/AccuWeather.h"
+ #include "../hardware/BleBox.h"
+ #include "../hardware/Ec3kMeterTCP.h"
+@@ -1093,6 +1094,9 @@ bool MainWorker::AddHardwareFromParams(
+ 	case HTYPE_DucoBoxSerial:
+ 		pHardware = new CDucoBoxSerial(ID, SerialPort);
+ 		break;
++	case HTYPE_Mfi:
++		pHardware = new CMfi(ID, Address, Port, Username, Password);
++		break;
+ 	case HTYPE_AirconWithMe:
+ 		pHardware = new CAirconWithMe(ID, Address, Port, Username, Password);
+ 		break;
+-- 
+2.51.0
+

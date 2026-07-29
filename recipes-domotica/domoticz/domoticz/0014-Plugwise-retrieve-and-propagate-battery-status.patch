@@ -1,0 +1,318 @@
+From ea6380b30f5efa2a6fd41b075a9a1855e30bb512 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:16:36 +0200
+Subject: [PATCH 14/50] Plugwise: retrieve and propagate battery status
+
+Parse battery robustly (0..1 and 0..100), determine battery level before dispatching point logs, and propagate the value to all applicable sensor updates.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 129 ++++++++----------------------------
+ 1 file changed, 26 insertions(+), 103 deletions(-)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 2a8a93ac6..3d851afcd 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -777,6 +777,7 @@ void CAnnaThermostat::GetMeterDetails()
+ 		std::string applianceID = "";
+ 		unsigned int applianceIDhex = 0;
+ 		bool hasValidApplianceId = false;
++		unsigned int batterypercentage = 255;
+ 
+ 		pAttribute = pAppliance->FirstAttribute();
+ 		if (pAttribute != nullptr)
+@@ -922,54 +923,12 @@ void CAnnaThermostat::GetMeterDetails()
+ 			continue;
+ 		}
+ 
+-		std::unordered_map<std::string, std::string> pointLogsByType;
+-		std::vector<std::string> pointLogOrder;
+-		float reportedTemperature = 0.0F;
+-		float uncorrectedTemperature = 0.0F;
+-		float temperatureOffset = 0.0F;
+-		int humidityPercent = 0;
+-		bool hasReportedTemperature = false;
+-		bool hasUncorrectedTemperature = false;
+-		bool hasTemperatureOffset = false;
+-		bool hasHumidity = false;
++		std::vector<std::pair<std::string, std::string>> pointLogs;
+ 		for (TiXmlElement* pLogElem = pElem; pLogElem; pLogElem = pLogElem->NextSiblingElement())
+ 		{
+ 			sname = GetElementChildValue(pLogElem, "type");
+ 			tmpstr = GetPeriodMeasurement(pLogElem);
+-
+-			if (!sname.empty())
+-			{
+-				auto it = pointLogsByType.find(sname);
+-				if (it == pointLogsByType.end())
+-				{
+-					pointLogOrder.push_back(sname);
+-					pointLogsByType.emplace(sname, tmpstr);
+-				}
+-				else if (!tmpstr.empty())
+-				{
+-					it->second = tmpstr;
+-				}
+-			}
+-
+-			if (sname == "temperature" && !tmpstr.empty())
+-				hasReportedTemperature = isNumericValue(tmpstr, reportedTemperature);
+-			else if (sname == "uncorrected_temperature" && !tmpstr.empty())
+-				hasUncorrectedTemperature = isNumericValue(tmpstr, uncorrectedTemperature);
+-			else if (sname == "temperature_offset" && !tmpstr.empty())
+-				hasTemperatureOffset = isNumericValue(tmpstr, temperatureOffset);
+-			else if (sname == "humidity" && !tmpstr.empty())
+-			{
+-				float humidityRaw = 0.0F;
+-				if (isNumericValue(tmpstr, humidityRaw))
+-				{
+-					humidityPercent = static_cast<int>(std::lround(humidityRaw));
+-					if (humidityPercent < 0)
+-						humidityPercent = 0;
+-					if (humidityPercent > 100)
+-						humidityPercent = 100;
+-					hasHumidity = true;
+-				}
+-			}
++			pointLogs.emplace_back(sname, tmpstr);
+ 
+ 			if (sname == "battery" && !tmpstr.empty())
+ 			{
+@@ -984,25 +943,10 @@ void CAnnaThermostat::GetMeterDetails()
+ 			}
+ 		}
+ 
+-		bool hasEffectiveTemperature = false;
+-		float effectiveTemperature = 0.0F;
+-		if (hasReportedTemperature)
+-		{
+-			effectiveTemperature = reportedTemperature;
+-			hasEffectiveTemperature = true;
+-		}
+-		else if (hasUncorrectedTemperature && hasTemperatureOffset)
+-		{
+-			effectiveTemperature = uncorrectedTemperature + temperatureOffset;
+-			hasEffectiveTemperature = true;
+-		}
+-
+-		bool temperaturePublished = false;
+-
+-		for (const auto& logType : pointLogOrder)
++		for (const auto& pointLog : pointLogs)
+ 		{
+-			sname = logType;
+-			tmpstr = pointLogsByType[sname];
++			sname = pointLog.first;
++			tmpstr = pointLog.second;
+ 
+ 			if (sname == "battery")
+ 			{
+@@ -1015,29 +959,22 @@ void CAnnaThermostat::GetMeterDetails()
+ 
+ 			if (sname == "temperature")
+ 			{
+-				if (hasHumidity && hasEffectiveTemperature)
+-				{
+-					SendTempHumSensor(applianceIDhex, batterypercentage, effectiveTemperature, humidityPercent, ApplianceName + " TempHum");
+-					temperaturePublished = true;
+-				}
+-				else if (!tmpstr.empty() || hasEffectiveTemperature)
++				if (!tmpstr.empty())
+ 				{
+ 					float temperature = (float)atof(tmpstr.c_str());
+-					SendTempSensor(applianceIDhex, 255, temperature, ApplianceName + " " + sname);;
++					SendTempSensor(applianceIDhex, batterypercentage, temperature, ApplianceName + " " + sname);;
+ 				}
+ 			}
+ 			else if (sname == "illuminance")
+ 			{
+-				tmpstr = GetPeriodMeasurement(pElem);
+ 				if (!tmpstr.empty())
+ 				{
+ 					float illuminance = (float)atof(tmpstr.c_str());
+-					SendLuxSensor(applianceIDhex, 1, 255, illuminance, ApplianceName + " " + sname);;
++					SendLuxSensor(applianceIDhex, 1, batterypercentage, illuminance, ApplianceName + " " + sname);;
+ 				}
+ 			}
+ 			else if (sname == "thermostat")
+ 			{
+-				tmpstr = GetPeriodMeasurement(pElem);
+ 				if (!tmpstr.empty())
+ 				{
+ 					float temperature = (float)atof(tmpstr.c_str());
+@@ -1086,32 +1023,30 @@ void CAnnaThermostat::GetMeterDetails()
+ 			}
+ 			else if (sname == "boiler_state")
+ 			{
+-				tmpstr = GetPeriodMeasurement(pElem);
+ 				if (!tmpstr.empty())
+ 				{
+ 					if (strcmp(tmpstr.c_str(), "on") == 0)
+ 					{
+-						SendSwitch(applianceIDhex, 1, 255, true, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 1, batterypercentage, true, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 					else
+ 					{
+-						SendSwitch(applianceIDhex, 1, 255, false, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 1, batterypercentage, false, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 				}
+ 			}
+ 			else if (sname == "flame_state")
+ 			{
+-				tmpstr = GetPeriodMeasurement(pElem);
+ 				if (!tmpstr.empty())
+ 				{
+ 					if (strcmp(tmpstr.c_str(), "on") == 0)
+ 					{
+ 
+-						SendSwitch(applianceIDhex, 2, 255, true, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 2, batterypercentage, true, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 					else
+ 					{
+-						SendSwitch(applianceIDhex, 2, 255, false, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 2, batterypercentage, false, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 				}
+ 			}
+@@ -1135,16 +1070,15 @@ void CAnnaThermostat::GetMeterDetails()
+ 					Log(LOG_ERROR, "AnnaTherm: Error getting ProximityID !");
+ 					continue;
+ 				}
+-				tmpstr = GetPeriodMeasurement(pElem);
+ 				if (!tmpstr.empty())
+ 				{
+ 					if (strcmp(tmpstr.c_str(), "on") == 0)
+ 					{
+-						SendSwitch(applianceIDhex, 3, 255, true, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 3, batterypercentage, true, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 					else
+ 					{
+-						SendSwitch(applianceIDhex, 3, 255, false, 0, ApplianceName + " " + sname, m_Name);
++						SendSwitch(applianceIDhex, 3, batterypercentage, false, 0, ApplianceName + " " + sname, m_Name);
+ 					}
+ 				}
+ 			}
+@@ -1195,101 +1129,90 @@ void CAnnaThermostat::GetMeterDetails()
+ 			}
+             else if (sname == "modulation_level")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float level = (float)atof(tmpstr.c_str()) * 100.F;
+-					SendPercentageSensor(applianceIDhex, 2, 255, level, ApplianceName + " " + sname);;
++					SendPercentageSensor(applianceIDhex, 2, batterypercentage, level, ApplianceName + " " + sname);;
+                 }
+             }
+             else if (sname == "central_heater_water_pressure")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float pressure = (float)atof(tmpstr.c_str());
+-                    SendPressureSensor(applianceIDhex, 1, 255, pressure, ApplianceName + " " + sname);;
++					SendPressureSensor(applianceIDhex, 1, batterypercentage, pressure, ApplianceName + " " + sname);;
+                 }
+             }
+             else if (sname == "signal_strength")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float dbm = (float)atof(tmpstr.c_str());
+-                    SendCustomSensor(applianceIDhex, 1, 255, dbm, sname, "dBm");
++					SendCustomSensor(applianceIDhex, 1, batterypercentage, dbm, sname, "dBm");
+                 }
+             }
+             else if (sname == "burner_starts")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float starts = (float)atof(tmpstr.c_str());
+-                    SendCustomSensor(applianceIDhex, 1, 255, starts, sname, "");
++					SendCustomSensor(applianceIDhex, 1, batterypercentage, starts, sname, "");
+                 }
+             }
+             else if (sname == "failed_burner_starts")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float starts = (float)atof(tmpstr.c_str());
+-                    SendCustomSensor(applianceIDhex, 1, 255, starts, sname, "");
++					SendCustomSensor(applianceIDhex, 1, batterypercentage, starts, sname, "");
+                 }
+             }
+             else if (sname == "burner_operation_time")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float hour = (float)atof(tmpstr.c_str());
+-                    SendCustomSensor(applianceIDhex, 1, 255, hour, sname, "Hour(s)");
++					SendCustomSensor(applianceIDhex, 1, batterypercentage, hour, sname, "Hour(s)");
+                 }
+             }
+             else if (sname == "domestic_hot_water_burner_operation_time")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float hour = (float)atof(tmpstr.c_str());
+-                    SendCustomSensor(applianceIDhex, 1, 255, hour, sname, "Hour(s)");
++					SendCustomSensor(applianceIDhex, 1, batterypercentage, hour, sname, "Hour(s)");
+                 }
+             }
+             else if (sname == "domestic_hot_water_flow")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float flow = (float)atof(tmpstr.c_str());
+-                    SendWaterflowSensor(applianceIDhex, 1, 255, flow, ApplianceName + " " + sname);;
++					SendWaterflowSensor(applianceIDhex, 1, batterypercentage, flow, ApplianceName + " " + sname);;
+                 }
+             }
+             else if (sname == "domestic_hot_water_temperature")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float temperature = (float)atof(tmpstr.c_str());
+-					SendTempSensor(applianceIDhex + 5, 255, temperature, ApplianceName + " " + sname);;
++					SendTempSensor(applianceIDhex + 5, batterypercentage, temperature, ApplianceName + " " + sname);;
+                 }
+             }
+             else if (sname == "humidity")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float humidity = (float)atof(tmpstr.c_str());
+-                    SendHumiditySensor(applianceIDhex, 255, humidity, ApplianceName + " " + sname);
++					SendHumiditySensor(applianceIDhex, batterypercentage, humidity, ApplianceName + " " + sname);
+                 }
+             }
+ 	    else if (sname == "valve_position")
+             {
+-                tmpstr = GetPeriodMeasurement(pElem);
+                 if (!tmpstr.empty())
+                 {
+                     float valveposition = (float)atof(tmpstr.c_str()) * 100;
+-                    SendPercentageSensor(applianceIDhex, 0, 255, valveposition, ApplianceName + " " + sname);
++					SendPercentageSensor(applianceIDhex, 0, batterypercentage, valveposition, ApplianceName + " " + sname);
+                 }
+             }
+         }
+-- 
+2.51.0
+

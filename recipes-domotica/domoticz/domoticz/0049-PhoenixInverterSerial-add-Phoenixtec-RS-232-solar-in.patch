@@ -1,0 +1,1018 @@
+From c91e24ec6d5d4cd0ddf5b9315ab3e26c49c2668f Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Fri, 31 Jul 2026 10:46:03 +0200
+Subject: [PATCH 49/50] PhoenixInverterSerial: add Phoenixtec RS-232 solar
+ inverter plugin
+
+Talks to AEG Protect PV 2800 (and OEM siblings: CMS2000, SunEzy, Orion,
+Eaton, KLNE SunTeams) over RS-232 9600 8N1 using the Phoenixtec binary
+framing protocol documented in aeg-inverter/PROTOCOL.md.
+
+HTYPE_PhoenixInverterSerial = 130. The hardware name contains 'USB' so
+Hardware.js shows the serial-port selector div automatically -- both
+direct RS-232 and USB-serial adapters are valid deployment paths.
+
+State machine: Disconnected -> Init -> SerialQuery -> SerialConfirm ->
+Version -> ParamFmt -> Params -> DataFmt -> Polling. Full startup
+handshake required before polling; timeout in any step triggers
+reconnect with 30s backoff.
+
+Devices created (NodeIDs stable):
+  1  kWh meter   PAC (W) + ETOTAL (kWh)
+  2  Voltage     VPV -- DC panel voltage
+  3  Voltage     VAC -- AC grid voltage
+  4  Current     IAC -- AC grid current
+  5  Custom      FAC -- grid frequency (Hz)
+  6  Temperature TEMP -- inverter heat-sink
+  7  Custom      ETODAY -- energy today (kWh)
+  8  Alert       operating mode + fault register summary
+  9  Text        model / firmware / serial (set once at startup)
+
+Protocol notes:
+- Frame: AA AA | src(2) | dst(2) | opcode(2) | len(1) | payload | csum(2)
+- Checksum = sum of all frame bytes mod 65536, big-endian
+- Pre-confirm dst=0x0000; post-confirm dst=0x0001
+- datafmt and data payloads carry no leading count byte -- LEN from the
+  frame header is authoritative
+- ETOTAL = ETOTALH*256 + ETOTALL*0.1 kWh; published even when PAC=0
+- ZAC=0xFFFF is a sentinel (not measured), not published
+- ETODAY zeroed before 09:00 when >1 kWh (stale from previous day)
+- Serial string sourced from serial-query response, not version payload
+
+Thread model: readCallback (ASyncSerial I/O thread) only writes to the
+ring buffer; ParseIncomingData and all state-machine logic run on the
+worker thread, avoiding data races on shared state.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: claude:claude-sonnet-5 [Read] [Edit] [Bash]
+Upstream-Status: Inappropriate [WIP]
+---
+ CMakeLists.txt                     |   1 +
+ hardware/PhoenixInverterSerial.cpp | 749 +++++++++++++++++++++++++++++
+ hardware/PhoenixInverterSerial.h   | 133 +++++
+ main/RFXNames.cpp                  |   4 +
+ main/RFXNames.h                    |   1 +
+ main/mainworker.cpp                |   5 +
+ 6 files changed, 893 insertions(+)
+ create mode 100644 hardware/PhoenixInverterSerial.cpp
+ create mode 100644 hardware/PhoenixInverterSerial.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 431944ad9..8f7d9e999 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -369,6 +369,7 @@ hardware/serial/serial.cpp
+ hardware/serial/impl/unix.cpp
+ hardware/SolarEdgeAPI.cpp
+ hardware/SolarMaxTCP.cpp
++hardware/PhoenixInverterSerial.cpp
+ hardware/Sterbox.cpp
+ hardware/SysfsGpio.cpp
+ hardware/Tado.cpp
+diff --git a/hardware/PhoenixInverterSerial.cpp b/hardware/PhoenixInverterSerial.cpp
+new file mode 100644
+index 000000000..6b6169cc8
+--- /dev/null
++++ b/hardware/PhoenixInverterSerial.cpp
+@@ -0,0 +1,749 @@
++#include "stdafx.h"
++#include "PhoenixInverterSerial.h"
++#include "../main/Logger.h"
++#include "../main/Helper.h"
++#include "../main/mainworker.h"
++#include "../main/SQLHelper.h"
++
++#include <cassert>
++#include <ctime>
++#include <sstream>
++
++// Phoenixtec binary framing protocol, RS-232 9600 8N1.
++// Full spec: aeg-inverter/PROTOCOL.md
++// Probe session (confirmed field values from live unit): aeg-inverter/PROBE_SESSION.md
++//
++// Frame wire format:
++//   AA AA | src(2 BE) | dst(2 BE) | opcode(2 BE) | len(1) | payload(len) | checksum(2 BE)
++//
++// Checksum: sum of *all* bytes in the frame including the AA AA preamble, mod 65536.
++//
++// Pre-handshake (before serial confirm): dst = 0x0000
++// After serial confirm:                  dst = 0x0001 (host-assigned inverter address)
++
++namespace {
++
++// Wire addresses
++constexpr uint16_t ADDR_HOST          = 0x0100;
++constexpr uint16_t ADDR_INVERTER_PRE  = 0x0000; // before serial confirm
++constexpr uint16_t ADDR_INVERTER      = 0x0001; // after serial confirm
++
++// Opcodes (host → inverter)
++constexpr uint16_t OP_INIT            = 0x0004; // bus reset, no reply
++constexpr uint16_t OP_SERIAL_QUERY    = 0x0000;
++constexpr uint16_t OP_SERIAL_CONFIRM  = 0x0001;
++constexpr uint16_t OP_VERSION         = 0x0103;
++constexpr uint16_t OP_PARAMFMT        = 0x0101;
++constexpr uint16_t OP_PARAMS          = 0x0104;
++constexpr uint16_t OP_DATAFMT         = 0x0100;
++constexpr uint16_t OP_DATA            = 0x0102;
++
++// Opcodes (inverter → host, response opcodes)
++constexpr uint16_t RSP_SERIAL         = 0x0080;
++constexpr uint16_t RSP_SERIAL_CONFIRM = 0x0081;
++constexpr uint16_t RSP_VERSION        = 0x0183;
++constexpr uint16_t RSP_PARAMFMT       = 0x0181;
++constexpr uint16_t RSP_PARAMS         = 0x0184;
++constexpr uint16_t RSP_DATAFMT        = 0x0180;
++constexpr uint16_t RSP_DATA           = 0x0182;
++
++// Data field codes (from config.ini / PROTOCOL.md §6)
++constexpr uint8_t FIELD_TEMP          = 0x00;
++constexpr uint8_t FIELD_ETODAY        = 0x0D;
++constexpr uint8_t FIELD_VPV           = 0x40;
++constexpr uint8_t FIELD_IAC           = 0x41;
++constexpr uint8_t FIELD_VAC           = 0x42;
++constexpr uint8_t FIELD_FAC           = 0x43;
++constexpr uint8_t FIELD_PAC           = 0x44;
++constexpr uint8_t FIELD_ZAC           = 0x45;
++constexpr uint8_t FIELD_ETOTALH       = 0x47;
++constexpr uint8_t FIELD_ETOTALL       = 0x48;
++constexpr uint8_t FIELD_HTOTALH       = 0x49;
++constexpr uint8_t FIELD_HTOTALL       = 0x4A;
++constexpr uint8_t FIELD_MODE          = 0x4C;
++constexpr uint8_t FIELD_ERR_GV        = 0x78;
++constexpr uint8_t FIELD_ERR_GF        = 0x79;
++constexpr uint8_t FIELD_ERR_GZ        = 0x7A;
++constexpr uint8_t FIELD_ERR_TEMP      = 0x7B;
++constexpr uint8_t FIELD_ERR_PV1       = 0x7C;
++constexpr uint8_t FIELD_ERR_GFC1      = 0x7D;
++constexpr uint8_t FIELD_ERR_MODE      = 0x7E;
++
++// ZAC = 0xFFFF means "not measured" on this hardware.
++constexpr uint16_t ZAC_SENTINEL       = 0xFFFF;
++
++// Retry / timing constants
++constexpr int RETRY_DELAY_SECS        = 30;
++constexpr int REPLY_TIMEOUT_SECS      = 5;  // per handshake step
++constexpr int HEARTBEAT_INTERVAL      = 12; // seconds between heartbeat ticks
++
++// Version payload layout (64 bytes), from live-capture byte analysis (PROBE_SESSION.md):
++//   [0..6]    capacity prefix "1  2800"
++//   [7..14]   firmware string "S1.00   "
++//   [15..30]  model string " PV2800         " (leading space, stripped by TrimField)
++//   [31..43]  manufacturer " Phoenixtec  " (leading space, stripped)
++//   [44..53]  three trailing spaces + serial start — serial is at [45..54], use
++//             m_inverterSerialBytes (from serial query) instead to avoid offset fragility.
++constexpr size_t VER_OFF_FIRMWARE     = 7;
++constexpr size_t VER_LEN_FIRMWARE     = 8;
++constexpr size_t VER_OFF_MODEL        = 15;
++constexpr size_t VER_LEN_MODEL        = 16;
++constexpr size_t VER_OFF_MANUF        = 31;
++constexpr size_t VER_LEN_MANUF        = 13;
++
++// Operating mode codes → human-readable labels
++const char* ModeName(uint16_t mode)
++{
++	switch (mode)
++	{
++		case 0:  return "Waiting";
++		case 1:  return "Normal";
++		case 2:  return "Fault";
++		case 3:  return "Permanent fault";
++		default: return "Unknown";
++	}
++}
++
++} // anonymous namespace
++
++// ---------------------------------------------------------------------------
++// Construction
++// ---------------------------------------------------------------------------
++
++CPhoenixInverterSerial::CPhoenixInverterSerial(const int ID, const std::string& devname, const int pollIntervalSecs)
++	: m_szSerialPort(devname)
++	, m_pollIntervalSecs(pollIntervalSecs > 0 ? pollIntervalSecs : 20)
++{
++	m_HwdID = ID;
++	memset(m_readBuf, 0, sizeof(m_readBuf));
++}
++
++CPhoenixInverterSerial::~CPhoenixInverterSerial()
++{
++	StopHardware();
++}
++
++bool CPhoenixInverterSerial::WriteToHardware(const char* /*pdata*/, const unsigned char /*length*/)
++{
++	// This inverter is read-only; no Domoticz→inverter commands are supported.
++	return false;
++}
++
++// ---------------------------------------------------------------------------
++// Thread lifecycle
++// ---------------------------------------------------------------------------
++
++bool CPhoenixInverterSerial::StartHardware()
++{
++	RequestStart();
++	// Trigger reconnect immediately on first iteration.
++	m_retryDelayCntr = RETRY_DELAY_SECS;
++	m_thread = std::make_shared<std::thread>([this] { Do_Work(); });
++	SetThreadNameInt(m_thread->native_handle());
++	return m_thread != nullptr;
++}
++
++bool CPhoenixInverterSerial::StopHardware()
++{
++	if (m_thread)
++	{
++		RequestStop();
++		m_thread->join();
++		m_thread.reset();
++	}
++	m_bIsStarted = false;
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// Serial port
++// ---------------------------------------------------------------------------
++
++bool CPhoenixInverterSerial::OpenSerialDevice()
++{
++	try
++	{
++		Log(LOG_STATUS, "Opening serial port %s at 9600 8N1", m_szSerialPort.c_str());
++		open(m_szSerialPort,
++		     9600,
++		     boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none),
++		     boost::asio::serial_port_base::character_size(8),
++		     boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::none),
++		     boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
++		setReadCallback([this](const char* data, size_t len) { readCallback(data, len); });
++		m_bIsStarted = true;
++		return true;
++	}
++	catch (std::exception& e)
++	{
++		Log(LOG_ERROR, "Error opening serial port: %s", e.what());
++		return false;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Main worker thread
++// ---------------------------------------------------------------------------
++
++void CPhoenixInverterSerial::Do_Work()
++{
++	Log(LOG_STATUS, "Worker started (port=%s, poll=%ds)", m_szSerialPort.c_str(), m_pollIntervalSecs);
++
++	while (!IsStopRequested(1000))
++	{
++		m_secondCntr++;
++
++		if (m_secondCntr % HEARTBEAT_INTERVAL == 0)
++			m_LastHeartbeat = mytime(nullptr);
++
++		// ---- reconnect path ----
++		if (!isOpen())
++		{
++			m_state = State::Disconnected;
++			m_waitingForReply = false;
++			m_readBufHead = 0;
++			m_readBufTail = 0;
++
++			if (m_retryDelayCntr == 0)
++				Log(LOG_STATUS, "Serial port closed, retrying in %d seconds", RETRY_DELAY_SECS);
++			m_retryDelayCntr++;
++			if (m_retryDelayCntr >= RETRY_DELAY_SECS)
++			{
++				m_retryDelayCntr = 0;
++				if (OpenSerialDevice())
++				{
++					m_state = State::Init;
++					SendInit();
++					// Give the inverter time to process the bus-reset before the
++					// serial query.  IsStopRequested doubles as an interruptible sleep.
++					if (IsStopRequested(1000))
++						return;
++					m_state = State::SerialQuery;
++					SendSerialQuery();
++					m_waitingForReply = true;
++					m_waitCntr = 0;
++				}
++			}
++			continue;
++		}
++
++		// ---- reply timeout guard (handshake steps) ----
++		// Parse any bytes that arrived since the last tick before checking timeouts
++		// so a fast-arriving response doesn't spuriously time out.
++		if (isOpen())
++			ParseIncomingData();
++
++		if (m_waitingForReply)
++		{
++			m_waitCntr++;
++			if (m_waitCntr >= REPLY_TIMEOUT_SECS)
++			{
++				Log(LOG_ERROR, "Timeout waiting for response in state %d; resetting",
++				    static_cast<int>(m_state));
++				close();
++				m_state = State::Disconnected;
++				m_waitingForReply = false;
++				m_retryDelayCntr = 0;
++			}
++			continue;
++		}
++
++		// ---- polling in steady state ----
++		if (m_state == State::Polling)
++		{
++			m_pollCntr++;
++			if (m_pollCntr >= m_pollIntervalSecs)
++			{
++				m_pollCntr = 0;
++				SendDataRequest();
++				m_waitingForReply = true;
++				m_waitCntr = 0;
++			}
++		}
++	}
++
++	if (isOpen())
++		close();
++	Log(LOG_STATUS, "Worker stopped");
++}
++
++// ---------------------------------------------------------------------------
++// Receive path
++// ---------------------------------------------------------------------------
++
++void CPhoenixInverterSerial::readCallback(const char* data, const size_t len)
++{
++	// Only accumulate bytes here; ParseIncomingData() is called from Do_Work so
++	// all state-machine logic stays on the worker thread, avoiding data races.
++	for (size_t i = 0; i < len; i++)
++	{
++		m_readBuf[m_readBufHead] = static_cast<uint8_t>(data[i]);
++		m_readBufHead = (m_readBufHead + 1) % READ_BUFFER_SIZE;
++		if (m_readBufHead == m_readBufTail)
++		{
++			// Overflow — drop the oldest byte.
++			m_readBufTail = (m_readBufTail + 1) % READ_BUFFER_SIZE;
++		}
++	}
++}
++
++void CPhoenixInverterSerial::ParseIncomingData()
++{
++	// Pull buffered bytes into a flat working vector for easier indexing.
++	std::vector<uint8_t> buf;
++	buf.reserve(READ_BUFFER_SIZE);
++	size_t pos = m_readBufTail;
++	while (pos != m_readBufHead)
++	{
++		buf.push_back(m_readBuf[pos]);
++		pos = (pos + 1) % READ_BUFFER_SIZE;
++	}
++
++	// Minimum complete frame: 2 (preamble) + 2 (src) + 2 (dst) + 2 (opcode) + 1 (len) + 2 (csum) = 11
++	constexpr size_t MIN_FRAME = 11;
++
++	size_t i = 0;
++	while (i + MIN_FRAME <= buf.size())
++	{
++		// Scan for AA AA preamble.
++		if (buf[i] != 0xAA || buf[i + 1] != 0xAA)
++		{
++			i++;
++			continue;
++		}
++
++		const uint8_t payloadLen = buf[i + 8];
++		const size_t frameLen = MIN_FRAME + payloadLen;
++
++		if (i + frameLen > buf.size())
++			break; // Incomplete frame, wait for more data.
++
++		// Validate checksum (sum of all frame bytes including preamble, mod 65536).
++		uint32_t sum = 0;
++		for (size_t k = 0; k < frameLen - 2; k++)
++			sum += buf[i + k];
++		const uint16_t calcCs = static_cast<uint16_t>(sum & 0xFFFF);
++		const uint16_t wireCs = (static_cast<uint16_t>(buf[i + frameLen - 2]) << 8)
++		                      |  static_cast<uint16_t>(buf[i + frameLen - 1]);
++
++		if (calcCs != wireCs)
++		{
++			// Bad checksum — skip this byte and re-scan.
++			i++;
++			continue;
++		}
++
++		// Valid frame: extract opcode and payload.
++		const uint16_t opcode = (static_cast<uint16_t>(buf[i + 6]) << 8)
++		                      |  static_cast<uint16_t>(buf[i + 7]);
++		std::vector<uint8_t> payload(buf.begin() + i + 9,
++		                             buf.begin() + i + 9 + payloadLen);
++
++		HandleFrame(opcode, payload);
++
++		i += frameLen;
++	}
++
++	// Consume the bytes we processed.
++	if (i > 0)
++	{
++		for (size_t k = 0; k < i; k++)
++			m_readBufTail = (m_readBufTail + 1) % READ_BUFFER_SIZE;
++	}
++}
++
++void CPhoenixInverterSerial::HandleFrame(const uint16_t opcode, const std::vector<uint8_t>& payload)
++{
++	m_waitingForReply = false;
++
++	switch (opcode)
++	{
++		case RSP_SERIAL:
++			if (m_state == State::SerialQuery)
++				HandleSerialResponse(payload);
++			break;
++		case RSP_SERIAL_CONFIRM:
++			if (m_state == State::SerialConfirm)
++				HandleSerialConfirmAck(payload);
++			break;
++		case RSP_VERSION:
++			if (m_state == State::Version)
++				HandleVersionResponse(payload);
++			break;
++		case RSP_PARAMFMT:
++			if (m_state == State::ParamFmt)
++				HandleParamFmtResponse(payload);
++			break;
++		case RSP_PARAMS:
++			if (m_state == State::Params)
++				HandleParamsResponse(payload);
++			break;
++		case RSP_DATAFMT:
++			if (m_state == State::DataFmt)
++				HandleDataFmtResponse(payload);
++			break;
++		case RSP_DATA:
++			if (m_state == State::Polling)
++				HandleDataResponse(payload);
++			break;
++		default:
++			Log(LOG_NORM, "Unexpected opcode 0x%04X in state %d", opcode, static_cast<int>(m_state));
++			break;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Handshake senders
++// ---------------------------------------------------------------------------
++
++void CPhoenixInverterSerial::SendInit()
++{
++	// Bus reset — no reply expected. Destination is 0x0000 (pre-confirm).
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER_PRE, OP_INIT, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: init (bus reset)");
++}
++
++void CPhoenixInverterSerial::SendSerialQuery()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER_PRE, OP_SERIAL_QUERY, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: serial query");
++}
++
++void CPhoenixInverterSerial::SendSerialConfirm()
++{
++	// Payload: serial bytes (10) + address byte 0x01 (assigns inverter address 0x0001).
++	std::vector<uint8_t> payload(m_inverterSerialBytes);
++	payload.push_back(0x01);
++	// Destination is still 0x0000 — the inverter hasn't been assigned its address yet.
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER_PRE, OP_SERIAL_CONFIRM, payload);
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: serial confirm");
++}
++
++void CPhoenixInverterSerial::SendVersionRequest()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER, OP_VERSION, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: version request");
++}
++
++void CPhoenixInverterSerial::SendParamFmtRequest()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER, OP_PARAMFMT, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: paramfmt request");
++}
++
++void CPhoenixInverterSerial::SendParamsRequest()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER, OP_PARAMS, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: params request");
++}
++
++void CPhoenixInverterSerial::SendDataFmtRequest()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER, OP_DATAFMT, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++	Log(LOG_NORM, "Sent: datafmt request");
++}
++
++void CPhoenixInverterSerial::SendDataRequest()
++{
++	auto frame = BuildFrame(ADDR_HOST, ADDR_INVERTER, OP_DATA, {});
++	write(reinterpret_cast<const char*>(frame.data()), frame.size());
++}
++
++// ---------------------------------------------------------------------------
++// Response handlers — each one advances the state machine
++// ---------------------------------------------------------------------------
++
++void CPhoenixInverterSerial::HandleSerialResponse(const std::vector<uint8_t>& payload)
++{
++	// Payload is exactly the inverter's serial number in ASCII (10 bytes).
++	if (payload.size() < 10)
++	{
++		Log(LOG_ERROR, "Serial response too short (%zu bytes)", payload.size());
++		close();
++		return;
++	}
++	m_inverterSerialBytes.assign(payload.begin(), payload.begin() + 10);
++	// Also store as string for the info sensor; serial query is the authoritative
++	// source — the version payload offset for the serial is fragile (see comment above).
++	m_serialStr = std::string(m_inverterSerialBytes.begin(), m_inverterSerialBytes.end());
++	Log(LOG_STATUS, "Inverter serial: %s", m_serialStr.c_str());
++
++	m_state = State::SerialConfirm;
++	SendSerialConfirm();
++	m_waitingForReply = true;
++	m_waitCntr = 0;
++}
++
++void CPhoenixInverterSerial::HandleSerialConfirmAck(const std::vector<uint8_t>& /*payload*/)
++{
++	// Address 0x0001 is now assigned; all subsequent requests use ADDR_INVERTER.
++	Log(LOG_STATUS, "Serial confirmed, inverter address assigned");
++	m_state = State::Version;
++	SendVersionRequest();
++	m_waitingForReply = true;
++	m_waitCntr = 0;
++}
++
++void CPhoenixInverterSerial::HandleVersionResponse(const std::vector<uint8_t>& payload)
++{
++	// 64-byte identity block.  Field offsets derived from live-capture analysis;
++	// see aeg-inverter/PROBE_SESSION.md for the annotated raw bytes.
++	if (payload.size() >= VER_OFF_MANUF + VER_LEN_MANUF)
++	{
++		m_firmware = TrimField(payload.data() + VER_OFF_FIRMWARE, VER_LEN_FIRMWARE);
++		m_model    = TrimField(payload.data() + VER_OFF_MODEL,    VER_LEN_MODEL);
++		m_manuf    = TrimField(payload.data() + VER_OFF_MANUF,    VER_LEN_MANUF);
++		// m_serialStr already set from serial query — don't re-parse here.
++		Log(LOG_STATUS, "Identity: model=%s manuf=%s fw=%s serial=%s",
++		    m_model.c_str(), m_manuf.c_str(), m_firmware.c_str(), m_serialStr.c_str());
++	}
++	else
++	{
++		Log(LOG_ERROR, "Version payload too short (%zu bytes)", payload.size());
++	}
++
++	m_state = State::ParamFmt;
++	SendParamFmtRequest();
++	m_waitingForReply = true;
++	m_waitCntr = 0;
++}
++
++void CPhoenixInverterSerial::HandleParamFmtResponse(const std::vector<uint8_t>& /*payload*/)
++{
++	// We don't use the parameter field list at runtime; just advance.
++	m_state = State::Params;
++	SendParamsRequest();
++	m_waitingForReply = true;
++	m_waitCntr = 0;
++}
++
++void CPhoenixInverterSerial::HandleParamsResponse(const std::vector<uint8_t>& /*payload*/)
++{
++	// Grid-protection parameters (VAC-MIN/MAX, FAC-MIN/MAX, etc.) are logged
++	// but we don't need them for data publishing.
++	m_state = State::DataFmt;
++	SendDataFmtRequest();
++	m_waitingForReply = true;
++	m_waitCntr = 0;
++}
++
++void CPhoenixInverterSerial::HandleDataFmtResponse(const std::vector<uint8_t>& payload)
++{
++	// The entire payload is the ordered list of field codes — no leading count byte.
++	// LEN in the frame header already tells us how many bytes (= how many fields).
++	if (payload.empty())
++	{
++		Log(LOG_ERROR, "DataFmt payload empty");
++		close();
++		return;
++	}
++	m_dataFields.assign(payload.begin(), payload.end());
++
++	Log(LOG_STATUS, "Data format negotiated: %zu fields", m_dataFields.size());
++	m_state = State::Polling;
++	m_pollCntr = m_pollIntervalSecs; // trigger an immediate first poll
++	Log(LOG_STATUS, "Handshake complete, entering polling state");
++}
++
++void CPhoenixInverterSerial::HandleDataResponse(const std::vector<uint8_t>& payload)
++{
++	// The entire payload is packed 16-bit big-endian words — no leading count byte.
++	// LEN from the frame header gives the byte count directly (e.g. 0x2a = 42 bytes
++	// = 21 words for this unit).
++	if (payload.empty())
++	{
++		Log(LOG_ERROR, "Empty data response");
++		return;
++	}
++
++	const size_t wordCount = payload.size() / 2;
++	const size_t available = std::min(wordCount, m_dataFields.size());
++
++	std::map<uint8_t, uint16_t> fields;
++	for (size_t i = 0; i < available; i++)
++	{
++		const uint16_t word = (static_cast<uint16_t>(payload[i * 2]) << 8)
++		                    |  static_cast<uint16_t>(payload[i * 2 + 1]);
++		fields[m_dataFields[i]] = word;
++	}
++
++	// ---- publish identity text sensor (once, after first data poll) ----
++	if (!m_identityPublished && !m_model.empty())
++	{
++		std::ostringstream info;
++		info << m_model;
++		if (!m_firmware.empty())  info << " fw=" << m_firmware;
++		if (!m_serialStr.empty()) info << " s/n=" << m_serialStr;
++		SendTextSensor(NODE_INFO, 1, 255, info.str(), "Inverter Info");
++		m_identityPublished = true;
++	}
++
++	// ---- helpers to look up a field safely ----
++	auto has = [&](uint8_t code) { return fields.count(code) != 0; };
++	auto get = [&](uint8_t code) { return fields.at(code); };
++
++	// ---- temperature (°C × 0.1) ----
++	if (has(FIELD_TEMP))
++		SendTempSensor(NODE_TEMP, 255, get(FIELD_TEMP) * 0.1f, "Inverter Temperature");
++
++	// ---- DC panel voltage (V × 0.1) ----
++	if (has(FIELD_VPV))
++		SendVoltageSensor(NODE_VPV, 1, 255, get(FIELD_VPV) * 0.1f, "Panel Voltage");
++
++	// ---- AC grid voltage (V × 0.1) ----
++	if (has(FIELD_VAC))
++		SendVoltageSensor(NODE_VAC, 2, 255, get(FIELD_VAC) * 0.1f, "Grid Voltage");
++
++	// ---- AC grid current (A × 0.1) ----
++	if (has(FIELD_IAC))
++		SendCurrentSensor(NODE_IAC, 255, get(FIELD_IAC) * 0.1f, 0.0f, 0.0f, "Grid Current");
++
++	// ---- AC grid frequency (Hz × 0.01) ----
++	if (has(FIELD_FAC))
++		SendCustomSensor(NODE_FAC, 1, 255, get(FIELD_FAC) * 0.01f, "Grid Frequency", "Hz");
++
++	// ---- ETOTAL: HIGH word × 256 kWh + LOW word × 0.1 kWh ----
++	// The two words arrive in the same data frame.  The LOW word rolls over
++	// at 6553.5 kWh, at which point HIGH increments by one.
++	double etotal = 0.0;
++	const bool haveEtotal = has(FIELD_ETOTALH) && has(FIELD_ETOTALL);
++	if (haveEtotal)
++		etotal = static_cast<double>(get(FIELD_ETOTALH)) * 256.0
++		       + static_cast<double>(get(FIELD_ETOTALL)) * 0.1;
++
++	// ---- PAC (W, integer) + ETOTAL → kWh meter ----
++	// Publish whenever we have ETOTAL, using PAC=0 when the inverter is idle/faulted
++	// rather than dropping the cumulative energy counter entirely.
++	if (haveEtotal)
++	{
++		const double pac_w = has(FIELD_PAC) ? static_cast<double>(get(FIELD_PAC)) : 0.0;
++		SendKwhMeter(NODE_KWH, 1, 255, pac_w, etotal, "Solar Energy");
++	}
++
++	// ---- ETODAY (kWh × 0.01) ----
++	// The inverter retains yesterday's ETODAY until it resets (up to ~30 min
++	// after first light).  If it's before 09:00 and the value exceeds 1 kWh,
++	// we can't trust it and must publish zero rather than confuse Domoticz.
++	if (has(FIELD_ETODAY))
++	{
++		const float etoday = get(FIELD_ETODAY) * 0.01f;
++		float reported = etoday;
++
++		time_t now = mytime(nullptr);
++		struct tm tmnow{};
++		localtime_r(&now, &tmnow);
++		if (tmnow.tm_hour < 9 && etoday > 1.0f)
++		{
++			Log(LOG_NORM, "ETODAY=%.2f kWh before 09:00 — stale from yesterday, reporting 0", etoday);
++			reported = 0.0f;
++		}
++		SendCustomSensor(NODE_ETODAY, 2, 255, reported, "Energy Today", "kWh");
++	}
++
++	// ---- operating mode + fault alert ----
++	// Alert levels: 1=green (normal), 3=orange (waiting/sleep), 4=red (fault).
++	if (has(FIELD_MODE))
++	{
++		const uint16_t mode = get(FIELD_MODE);
++		const bool anyFault = (has(FIELD_ERR_GV)   && get(FIELD_ERR_GV))
++		                   || (has(FIELD_ERR_GF)    && get(FIELD_ERR_GF))
++		                   || (has(FIELD_ERR_GZ)    && get(FIELD_ERR_GZ))
++		                   || (has(FIELD_ERR_TEMP)  && get(FIELD_ERR_TEMP))
++		                   || (has(FIELD_ERR_PV1)   && get(FIELD_ERR_PV1))
++		                   || (has(FIELD_ERR_GFC1)  && get(FIELD_ERR_GFC1))
++		                   || (has(FIELD_ERR_MODE)  && get(FIELD_ERR_MODE));
++
++		int alertLevel;
++		std::string alertMsg;
++		if (anyFault || mode == 2 || mode == 3)
++		{
++			// Any active fault register or non-normal mode = red, regardless of the
++			// mode word.  A set fault register with mode still reading "Normal" is
++			// a real fault condition, not just a warning.
++			alertLevel = 4;
++			std::ostringstream msg;
++			msg << ModeName(mode);
++			if (has(FIELD_ERR_GV)   && get(FIELD_ERR_GV))   msg << " ERR_GV";
++			if (has(FIELD_ERR_GF)   && get(FIELD_ERR_GF))   msg << " ERR_GF";
++			if (has(FIELD_ERR_GZ)   && get(FIELD_ERR_GZ))   msg << " ERR_GZ";
++			if (has(FIELD_ERR_TEMP) && get(FIELD_ERR_TEMP)) msg << " ERR_TEMP";
++			if (has(FIELD_ERR_PV1)  && get(FIELD_ERR_PV1))  msg << " ERR_PV1";
++			if (has(FIELD_ERR_GFC1) && get(FIELD_ERR_GFC1)) msg << " ERR_GFC1";
++			if (has(FIELD_ERR_MODE) && get(FIELD_ERR_MODE)) msg << " ERR_MODE";
++			alertMsg = msg.str();
++		}
++		else
++		{
++			alertLevel = 1; // green
++			alertMsg   = ModeName(mode);
++		}
++		SendAlertSensor(NODE_ALERT, 255, alertLevel, alertMsg, "Inverter Status");
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Frame builder
++// ---------------------------------------------------------------------------
++
++std::vector<uint8_t> CPhoenixInverterSerial::BuildFrame(
++    const uint16_t src, const uint16_t dst,
++    const uint16_t opcode,
++    const std::vector<uint8_t>& payload) const
++{
++	std::vector<uint8_t> frame;
++	frame.reserve(11 + payload.size());
++
++	frame.push_back(0xAA);
++	frame.push_back(0xAA);
++	frame.push_back(static_cast<uint8_t>(src >> 8));
++	frame.push_back(static_cast<uint8_t>(src & 0xFF));
++	frame.push_back(static_cast<uint8_t>(dst >> 8));
++	frame.push_back(static_cast<uint8_t>(dst & 0xFF));
++	frame.push_back(static_cast<uint8_t>(opcode >> 8));
++	frame.push_back(static_cast<uint8_t>(opcode & 0xFF));
++	frame.push_back(static_cast<uint8_t>(payload.size()));
++	for (uint8_t b : payload)
++		frame.push_back(b);
++
++	const uint16_t cs = FrameChecksum(frame);
++	frame.push_back(static_cast<uint8_t>(cs >> 8));
++	frame.push_back(static_cast<uint8_t>(cs & 0xFF));
++
++	return frame;
++}
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++// Sum of every byte in the frame body (before the checksum bytes), mod 65536.
++// Verified against multiple live frames including the probe session captures.
++uint16_t CPhoenixInverterSerial::FrameChecksum(const std::vector<uint8_t>& frame)
++{
++	uint32_t sum = 0;
++	for (uint8_t b : frame)
++		sum += b;
++	return static_cast<uint16_t>(sum & 0xFFFF);
++}
++
++// Extract a fixed-width ASCII field, stripping leading and trailing spaces.
++std::string CPhoenixInverterSerial::TrimField(const uint8_t* buf, const size_t len)
++{
++	std::string s(reinterpret_cast<const char*>(buf), len);
++	// Strip leading spaces.
++	const size_t start = s.find_first_not_of(' ');
++	if (start == std::string::npos)
++		return {};
++	// Strip trailing spaces and non-printable bytes.
++	size_t end = s.size();
++	while (end > start && (s[end - 1] == ' ' || s[end - 1] < 0x20))
++		end--;
++	return s.substr(start, end - start);
++}
+diff --git a/hardware/PhoenixInverterSerial.h b/hardware/PhoenixInverterSerial.h
+new file mode 100644
+index 000000000..dfb931c81
+--- /dev/null
++++ b/hardware/PhoenixInverterSerial.h
+@@ -0,0 +1,133 @@
++#pragma once
++#ifndef PHOENIX_INVERTER_SERIAL_H
++#define PHOENIX_INVERTER_SERIAL_H
++
++#include "ASyncSerial.h"
++#include "DomoticzHardware.h"
++#include <string>
++#include <vector>
++#include <thread>
++#include <memory>
++
++// Phoenixtec RS-232 solar inverter plugin.
++//
++// Speaks the binary framing protocol used by the AEG Protect PV 2800 and many
++// OEM siblings (CMS2000, SunEzy, Orion, Eaton, KLNE SunTeams).  The full
++// protocol is documented in aeg-inverter/PROTOCOL.md.
++//
++// Physical layer: 9600 8N1, no flow control.  The inverter is a passive slave;
++// it never initiates traffic and is silent when there is no PV input at night.
++
++class CPhoenixInverterSerial : public AsyncSerial, public CDomoticzHardwareBase
++{
++public:
++	CPhoenixInverterSerial(int ID, const std::string& devname, int pollIntervalSecs);
++	~CPhoenixInverterSerial() override;
++	bool WriteToHardware(const char* pdata, unsigned char length) override;
++
++private:
++	// ---- lifecycle ---------------------------------------------------------
++	bool StartHardware() override;
++	bool StopHardware() override;
++	bool OpenSerialDevice();
++	void Do_Work();
++	void readCallback(const char* data, size_t len);
++
++	// ---- protocol state machine --------------------------------------------
++	enum class State
++	{
++		Disconnected,
++		Init,          // sent 0x0004 reset, waiting before serial query
++		SerialQuery,   // sent 0x0000, awaiting 0x0080 serial response
++		SerialConfirm, // sent 0x0001 confirm, awaiting 0x0081 ack
++		Version,       // sent 0x0103, awaiting 0x0183 version block
++		ParamFmt,      // sent 0x0101, awaiting 0x0181 param-field list
++		Params,        // sent 0x0104, awaiting 0x0184 parameter values
++		DataFmt,       // sent 0x0100, awaiting 0x0180 data-field list
++		Polling,       // steady-state: periodic 0x0102 data polls
++	};
++
++	// ---- frame I/O ---------------------------------------------------------
++	// Build a complete wire frame (preamble + header + payload + checksum).
++	std::vector<uint8_t> BuildFrame(uint16_t src, uint16_t dst,
++	                                uint16_t opcode,
++	                                const std::vector<uint8_t>& payload) const;
++	// Drain m_readBuf: find AA AA frames, validate checksum, dispatch.
++	void ParseIncomingData();
++	// Dispatch a validated frame to the right handler.
++	void HandleFrame(uint16_t opcode, const std::vector<uint8_t>& payload);
++
++	// ---- handshake senders -------------------------------------------------
++	void SendInit();
++	void SendSerialQuery();
++	void SendSerialConfirm();
++	void SendVersionRequest();
++	void SendParamFmtRequest();
++	void SendParamsRequest();
++	void SendDataFmtRequest();
++	void SendDataRequest();
++
++	// ---- response handlers -------------------------------------------------
++	void HandleSerialResponse(const std::vector<uint8_t>& payload);
++	void HandleSerialConfirmAck(const std::vector<uint8_t>& payload);
++	void HandleVersionResponse(const std::vector<uint8_t>& payload);
++	void HandleParamFmtResponse(const std::vector<uint8_t>& payload);
++	void HandleParamsResponse(const std::vector<uint8_t>& payload);
++	void HandleDataFmtResponse(const std::vector<uint8_t>& payload);
++	void HandleDataResponse(const std::vector<uint8_t>& payload);
++
++	// ---- helpers -----------------------------------------------------------
++	static uint16_t FrameChecksum(const std::vector<uint8_t>& frame);
++	static std::string TrimField(const uint8_t* buf, size_t len);
++
++	// ---- config ------------------------------------------------------------
++	std::string m_szSerialPort;
++	int         m_pollIntervalSecs;
++
++	// ---- state -------------------------------------------------------------
++	State  m_state          = State::Disconnected;
++	int    m_retryDelayCntr = 0;
++	int    m_secondCntr     = 0;
++	int    m_pollCntr       = 0;
++	int    m_waitCntr       = 0;   // timeout guard while awaiting a response
++	bool   m_waitingForReply = false;
++
++	// Inverter serial number captured during serial query (raw ASCII bytes).
++	std::vector<uint8_t> m_inverterSerialBytes;
++
++	// Data-field codes negotiated during datafmt handshake (ordered list).
++	std::vector<uint8_t> m_dataFields;
++
++	// Identity strings, published once to the text sensor.
++	std::string m_firmware;
++	std::string m_model;
++	std::string m_manuf;
++	std::string m_serialStr;
++	bool        m_identityPublished = false;
++
++	// ---- receive buffer ----------------------------------------------------
++	// Large enough to hold the biggest expected frame (version = ~80 bytes).
++	static constexpr size_t READ_BUFFER_SIZE = 512;
++	uint8_t          m_readBuf[READ_BUFFER_SIZE];
++	// Head is written by the ASyncSerial I/O thread (readCallback) and read
++	// by the worker thread (Do_Work → ParseIncomingData).  volatile prevents
++	// the compiler from caching the value across the IsStopRequested(1000) sleep.
++	volatile size_t  m_readBufHead = 0; // write position (I/O thread)
++	size_t           m_readBufTail = 0; // read position  (worker thread only)
++
++	// ---- thread ------------------------------------------------------------
++	std::shared_ptr<std::thread> m_thread;
++
++	// ---- sensor node IDs (stable, must not change once created) ------------
++	static constexpr int NODE_KWH       = 1; // kWh meter  (PAC + ETOTAL)
++	static constexpr int NODE_VPV       = 2; // DC panel voltage
++	static constexpr int NODE_VAC       = 3; // AC grid voltage
++	static constexpr int NODE_IAC       = 4; // AC grid current
++	static constexpr int NODE_FAC       = 5; // AC grid frequency (custom, Hz)
++	static constexpr int NODE_TEMP      = 6; // internal temperature
++	static constexpr int NODE_ETODAY    = 7; // energy today (custom, kWh)
++	static constexpr int NODE_ALERT     = 8; // mode + fault alert
++	static constexpr int NODE_INFO      = 9; // firmware/model text (set once)
++};
++
++#endif // PHOENIX_INVERTER_SERIAL_H
+diff --git a/main/RFXNames.cpp b/main/RFXNames.cpp
+index 77954cef6..373907bcb 100755
+--- a/main/RFXNames.cpp
++++ b/main/RFXNames.cpp
+@@ -283,6 +283,10 @@ static const STR_TABLE_SINGLE HardwareTypeTable[] = {
+ 	{ HTYPE_Matter, "Matter (python-matterjs-server)", "Matter" },
+ 	{ HTYPE_DucoBoxSerial, "DucoBox Serial USB", "DucoBox" },
+ 	{ HTYPE_Mfi, "Ubiquiti mFi/mPower LAN (HTTP) interface", "mFi" },
++	// Name must contain "USB" so Hardware.js shows the serial-port selector div.
++	// The inverter uses straight RS-232 but USB-serial adapters are the common
++	// deployment path; the label reflects both options honestly.
++	{ HTYPE_PhoenixInverterSerial, "Phoenixtec Solar Inverter USB/Serial", "PhoenixInv" },
+ 	{ 0, nullptr, nullptr },
+ };
+ 
+diff --git a/main/RFXNames.h b/main/RFXNames.h
+index 7d15130f8..20f5d8b2e 100644
+--- a/main/RFXNames.h
++++ b/main/RFXNames.h
+@@ -227,6 +227,7 @@ enum _eHardwareTypes {
+ 	HTYPE_Matter,				//129
+ 	HTYPE_DucoBoxSerial,		//130
+ 	HTYPE_Mfi,					//131
++	HTYPE_PhoenixInverterSerial,//132
+ 	HTYPE_END
+ };
+ 
+diff --git a/main/mainworker.cpp b/main/mainworker.cpp
+index 8fb39bc6d..515a3fd7c 100644
+--- a/main/mainworker.cpp
++++ b/main/mainworker.cpp
+@@ -161,6 +161,7 @@
+ #include "../hardware/Enever.h"
+ #include "../hardware/MitsubishiWF.h"
+ #include "../hardware/Matter.h"
++#include "../hardware/PhoenixInverterSerial.h"
+ 
+ // load notifications configuration
+ #include "../notifications/NotificationHelper.h"
+@@ -1123,6 +1124,10 @@ bool MainWorker::AddHardwareFromParams(
+ 		}
+ 		break;
+ 
++	case HTYPE_PhoenixInverterSerial:
++		pHardware = new CPhoenixInverterSerial(ID, SerialPort, Mode1);
++		break;
++
+ 	}
+ 
+ 	if (pHardware)
+-- 
+2.51.0
+

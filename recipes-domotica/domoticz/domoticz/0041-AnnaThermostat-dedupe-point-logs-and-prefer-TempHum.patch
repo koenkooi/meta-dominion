@@ -1,0 +1,147 @@
+From f72af4ca18163a3e72a9f2f1c50554dce1df682e Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Thu, 23 Jul 2026 13:13:17 +0200
+Subject: [PATCH 41/50] AnnaThermostat: dedupe point logs and prefer TempHum
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 74 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 66 insertions(+), 8 deletions(-)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 72d7785c0..776397a1a 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -11,6 +11,7 @@
+ #include "../tinyxpath/tinyxml.h"
+ #include <vector>
+ #include <functional>
++#include <unordered_map>
+ #include <unordered_set>
+ 
+ //GizMoCuz: Whoever is maintaining this class, please make use of the internal functions (like SendTempSensor) and remove them internal functions in here
+@@ -925,18 +926,34 @@ void CAnnaThermostat::GetMeterDetails()
+ 			continue;
+ 		}
+ 
+-		std::vector<std::pair<std::string, std::string>> pointLogs;
++		std::unordered_map<std::string, std::string> pointLogsByType;
++		std::vector<std::string> pointLogOrder;
+ 		float reportedTemperature = 0.0F;
+ 		float uncorrectedTemperature = 0.0F;
+ 		float temperatureOffset = 0.0F;
++		int humidityPercent = 0;
+ 		bool hasReportedTemperature = false;
+ 		bool hasUncorrectedTemperature = false;
+ 		bool hasTemperatureOffset = false;
++		bool hasHumidity = false;
+ 		for (TiXmlElement* pLogElem = pElem; pLogElem; pLogElem = pLogElem->NextSiblingElement())
+ 		{
+ 			sname = GetElementChildValue(pLogElem, "type");
+ 			tmpstr = GetPeriodMeasurement(pLogElem);
+-			pointLogs.emplace_back(sname, tmpstr);
++
++			if (!sname.empty())
++			{
++				auto it = pointLogsByType.find(sname);
++				if (it == pointLogsByType.end())
++				{
++					pointLogOrder.push_back(sname);
++					pointLogsByType.emplace(sname, tmpstr);
++				}
++				else if (!tmpstr.empty())
++				{
++					it->second = tmpstr;
++				}
++			}
+ 
+ 			if (sname == "temperature" && !tmpstr.empty())
+ 				hasReportedTemperature = isNumericValue(tmpstr, reportedTemperature);
+@@ -944,6 +961,19 @@ void CAnnaThermostat::GetMeterDetails()
+ 				hasUncorrectedTemperature = isNumericValue(tmpstr, uncorrectedTemperature);
+ 			else if (sname == "temperature_offset" && !tmpstr.empty())
+ 				hasTemperatureOffset = isNumericValue(tmpstr, temperatureOffset);
++			else if (sname == "humidity" && !tmpstr.empty())
++			{
++				float humidityRaw = 0.0F;
++				if (isNumericValue(tmpstr, humidityRaw))
++				{
++					humidityPercent = static_cast<int>(std::lround(humidityRaw));
++					if (humidityPercent < 0)
++						humidityPercent = 0;
++					if (humidityPercent > 100)
++						humidityPercent = 100;
++					hasHumidity = true;
++				}
++			}
+ 
+ 			if (sname == "battery" && !tmpstr.empty())
+ 			{
+@@ -972,11 +1002,12 @@ void CAnnaThermostat::GetMeterDetails()
+ 		}
+ 
+ 		bool temperaturePublished = false;
++		bool tempHumPublished = false;
+ 
+-		for (const auto& pointLog : pointLogs)
++		for (const auto& logType : pointLogOrder)
+ 		{
+-			sname = pointLog.first;
+-			tmpstr = pointLog.second;
++			sname = logType;
++			tmpstr = pointLogsByType[sname];
+ 
+ 			if (sname == "battery")
+ 			{
+@@ -989,7 +1020,13 @@ void CAnnaThermostat::GetMeterDetails()
+ 
+ 			if (sname == "temperature")
+ 			{
+-				if (!tmpstr.empty() || hasEffectiveTemperature)
++				if (hasHumidity && hasEffectiveTemperature)
++				{
++					SendTempHumSensor(applianceIDhex, batterypercentage, effectiveTemperature, humidityPercent, ApplianceName + " TempHum");
++					tempHumPublished = true;
++					temperaturePublished = true;
++				}
++				else if (!tmpstr.empty() || hasEffectiveTemperature)
+ 				{
+ 					float temperature = hasEffectiveTemperature ? effectiveTemperature : (float)atof(tmpstr.c_str());
+ 					SendTempSensor(applianceIDhex, batterypercentage, temperature, ApplianceName + " " + sname);;
+@@ -1447,8 +1484,29 @@ void CAnnaThermostat::GetMeterDetails()
+             {
+                 if (!tmpstr.empty())
+                 {
+-                    float humidity = (float)atof(tmpstr.c_str());
+-					SendHumiditySensor(applianceIDhex, batterypercentage, humidity, ApplianceName + " " + sname);
++					float humidityRaw = 0.0F;
++					if (!isNumericValue(tmpstr, humidityRaw))
++						continue;
++
++					int humidityLocal = static_cast<int>(std::lround(humidityRaw));
++					if (humidityLocal < 0)
++						humidityLocal = 0;
++					if (humidityLocal > 100)
++						humidityLocal = 100;
++
++					if (hasEffectiveTemperature)
++					{
++						if (!tempHumPublished)
++						{
++							SendTempHumSensor(applianceIDhex, batterypercentage, effectiveTemperature, humidityLocal, ApplianceName + " TempHum");
++							tempHumPublished = true;
++						}
++						temperaturePublished = true;
++					}
++					else
++					{
++						SendHumiditySensor(applianceIDhex, batterypercentage, humidityLocal, ApplianceName + " " + sname);
++					}
+                 }
+             }
+ 	    else if (sname == "valve_position")
+-- 
+2.51.0
+

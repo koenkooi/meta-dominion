@@ -1,0 +1,28 @@
+From ea0e42c4cd35614832194599c6d358f8dd408d17 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Thu, 9 Jul 2026 16:37:20 +0200
+Subject: [PATCH 42/50] AnnaThermostat: remove stale maintainer note
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 776397a1a..96348c333 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -14,8 +14,6 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+-//GizMoCuz: Whoever is maintaining this class, please make use of the internal functions (like SendTempSensor) and remove them internal functions in here
+-
+ // Plugwise Anna Thermostat
+ // Anna Sensors
+ // Anna Switches
+-- 
+2.51.0
+
