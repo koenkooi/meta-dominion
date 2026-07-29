@@ -1,0 +1,37 @@
+From 46075059f8c0b2f9a540976e773702d73373298b Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:17:11 +0200
+Subject: [PATCH 17/50] AnnaThermostat: add support for wlan_state
+
+Parse wlan_state and publish it as an on/off switch sensor.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index b425c739e..23a3e0660 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1151,6 +1151,14 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendSwitch(applianceIDhex, 4, batterypercentage, isOn, 0, ApplianceName + " " + sname, m_Name);
+ 				}
+ 			}
++			else if (sname == "wlan_state")
++			{
++				if (!tmpstr.empty())
++				{
++					bool isOn = (strcmp(tmpstr.c_str(), "up") == 0);
++					SendSwitch(applianceIDhex, 5, batterypercentage, isOn, 0, ApplianceName + " " + sname, m_Name);
++				}
++			}
+             else if (sname == "central_heater_water_pressure")
+             {
+                 if (!tmpstr.empty())
+-- 
+2.51.0
+

@@ -1,0 +1,127 @@
+From f3762e65bf2cbf11bcc5f50759cf122a7894b98c Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:48:52 +0200
+Subject: [PATCH 11/50] AnnaThermostat: add generic control functionality
+ mapping
+
+Publish unhandled actuator functionality values as switch/custom/text devices based on detected state type.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 62 +++++++++++++++++++++++--------------
+ 1 file changed, 38 insertions(+), 24 deletions(-)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 9f461be89..8a1ff6079 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -180,18 +180,50 @@ bool CAnnaThermostat::WriteToHardware(const char* pdata, const unsigned char /*l
+ {
+ 	const tRBUF* pCmd = reinterpret_cast<const tRBUF*>(pdata);
+ 	unsigned char packettype = pCmd->ICMND.packettype;
++	auto writeSwitchTarget = [this](int32_t key, bool isOn) -> bool
++	{
++		ControlTarget target;
++		{
++			std::lock_guard<std::mutex> lock(m_StateMutex);
++			auto it = m_SwitchTargets.find(key);
++			if (it != m_SwitchTargets.end())
++				target = it->second;
++		}
++		if (target.endpoint.empty())
++			return false;
++
++		if (target.endpoint == "relay_functionality" || target.endpoint == "relay")
++			return PutRelayFunctionality(target, isOn);
++		if (target.endpoint == "toggle_functionality" || target.endpoint == "toggle")
++			return PutToggleFunctionality(target, isOn);
++
++		return false;
++	};
+ 	if (packettype == pTypeLighting2)
+ 	{
+-		int node_id = pCmd->LIGHTING2.id4;
+-		bool bIsOn = (pCmd->LIGHTING2.cmnd == light2_sOn);
+-		if (node_id == sAnnaBoilerState || node_id == sAnnaFlameState)
++		const int32_t nodeId = (static_cast<int32_t>(pCmd->LIGHTING2.id1) << 24)
++			| (static_cast<int32_t>(pCmd->LIGHTING2.id2) << 16)
++			| (static_cast<int32_t>(pCmd->LIGHTING2.id3) << 8)
++			| static_cast<int32_t>(pCmd->LIGHTING2.id4);
++		bool isOn = false;
++		if (pCmd->LIGHTING2.cmnd == light2_sOn)
++			isOn = true;
++		else if (pCmd->LIGHTING2.cmnd == light2_sOff)
++			isOn = false;
++		else
++			return false;
++
++		if (nodeId == sAnnaBoilerState || nodeId == sAnnaFlameState)
+ 		{
+ 			return false; // just return Error as these are not supposed to be switches
+ 		}
+-		if (node_id == sAnnaProximity)
++		if (nodeId == sAnnaProximity)
+ 		{
+-			return AnnaToggleProximity(bIsOn);
++			return AnnaToggleProximity(isOn);
+ 		}
++
++		const int32_t key = (nodeId << 8) | static_cast<int32_t>(pCmd->LIGHTING2.unitcode & 0xFF);
++		return writeSwitchTarget(key, isOn);
+ 	}
+ 	else if (packettype == pTypeSetpoint)
+ 	{
+@@ -247,22 +279,7 @@ bool CAnnaThermostat::WriteToHardware(const char* pdata, const unsigned char /*l
+ 			return false;
+ 
+ 		const int32_t key = (xcmd->id << 8) | (xcmd->unitcode & 0xFF);
+-		ControlTarget target;
+-		{
+-			std::lock_guard<std::mutex> lock(m_StateMutex);
+-			auto it = m_SwitchTargets.find(key);
+-			if (it != m_SwitchTargets.end())
+-				target = it->second;
+-		}
+-		if (target.endpoint.empty())
+-			return false;
+-
+-		if (target.endpoint == "relay_functionality" || target.endpoint == "relay")
+-			return PutRelayFunctionality(target, isOn);
+-		if (target.endpoint == "toggle_functionality" || target.endpoint == "toggle")
+-			return PutToggleFunctionality(target, isOn);
+-
+-		return false;
++		return writeSwitchTarget(key, isOn);
+ 	}
+ 	return false;
+ }
+@@ -675,7 +692,6 @@ void CAnnaThermostat::GetMeterDetails()
+ 		}
+ 		return false;
+ 	};
+-
+ 	auto relayChildForType = [](const std::string& functionType) -> uint8_t
+ 	{
+ 		if (functionType.empty() || functionType == "relay")
+@@ -693,7 +709,6 @@ void CAnnaThermostat::GetMeterDetails()
+ 			return 12;
+ 		return static_cast<uint8_t>(170 + (std::hash<std::string>{}(functionType) % 40));
+ 	};
+-
+ 	pRoot = doc.FirstChildElement("appliances");
+ 	if (!pRoot)
+ 	{
+@@ -855,7 +870,6 @@ void CAnnaThermostat::GetMeterDetails()
+ 					newSetpointTargets[key].push_back(target);
+ 				}
+ 			}
+-
+ 			std::string value = GetElementChildValue(pFunc, "state");
+ 			if (value.empty())
+ 				value = GetElementChildValue(pFunc, "setpoint");
+-- 
+2.51.0
+

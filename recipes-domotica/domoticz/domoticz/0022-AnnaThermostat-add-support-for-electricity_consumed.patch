@@ -1,0 +1,38 @@
+From 6926ca9cc084a061c8f34816bd4f78ac95745591 Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 8 Jul 2026 16:18:01 +0200
+Subject: [PATCH 22/50] AnnaThermostat: add support for electricity_consumed
+
+Parse electricity_consumed and publish a watt estimate (Wh/15m -> W) for stateless reporting.
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+Assisted-by: GPT-5.3-Codex
+
+Upstream-Status: Inappropriate [WIP]
+---
+ hardware/AnnaThermostat.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/hardware/AnnaThermostat.cpp b/hardware/AnnaThermostat.cpp
+index 13ab75329..dafb39e62 100644
+--- a/hardware/AnnaThermostat.cpp
++++ b/hardware/AnnaThermostat.cpp
+@@ -1255,6 +1255,15 @@ void CAnnaThermostat::GetMeterDetails()
+ 					SendWaterflowSensor(applianceIDhex, 1, batterypercentage, flow, ApplianceName + " " + sname);;
+                 }
+             }
++			else if (sname == "electricity_consumed")
++			{
++				if (!tmpstr.empty())
++				{
++					// Reported value is Wh per 15 minutes, approximate to W.
++					float plugusage = (float)atof(tmpstr.c_str()) * 4.0F;
++					SendWattMeter(applianceIDhex, 0, batterypercentage, plugusage, ApplianceName + " " + sname);
++				}
++			}
+             else if (sname == "domestic_hot_water_temperature")
+             {
+                 if (!tmpstr.empty())
+-- 
+2.51.0
+

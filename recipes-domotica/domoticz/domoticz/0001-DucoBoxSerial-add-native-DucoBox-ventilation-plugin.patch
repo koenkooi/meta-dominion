@@ -1,0 +1,2738 @@
+From a9967391bc2f937aabc3837f3015f557f1ee3fca Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Fri, 31 Jul 2026 08:36:00 +0200
+Subject: [PATCH 01/50] DucoBoxSerial: add native DucoBox ventilation plugin
+
+Talks to a DucoBox Focus/Silent over its serial CLI and publishes each node as
+Domoticz devices: temperature, humidity, CO2, airflow percentage and the derived
+flow, box fan speed and power draw, switch state, override mode and countdown,
+plus the setpoints and thresholds that can be written back.
+
+Device identity is a pure function of node id and capability. It must not depend
+on runtime state, because an id that can change is a device Domoticz silently
+recreates -- stranding the original under its name and splitting the history
+between them.
+
+The box is a slow single-master bus that answers one command at a time, and most
+of what follows exists because of that.
+
+Replies are read from their own command's echo onwards. The box echoes what it
+received, so anything ahead of that echo belongs to an earlier command still
+arriving. Reading the whole buffer let one command answer another: raw humidity
+in centi-percent was published as CO2 in ppm, and a write the box had confirmed
+was reported as rejected because a leftover node table happened to contain the
+word "Failed".
+
+A quiet window is held before each command, two seconds either side of the node
+table, so a previous reply arrives before the buffer is drained rather than just
+after it.
+
+Budgets are per command and were measured, not chosen: 20s for the two commands
+that dump a node table, which take 10-12s, and 10s for everything else, where the
+slowest success observed was 4.4s. Retrying cannot help a reply that is merely
+slow, so the table reads get one or two attempts rather than three.
+
+A command whose read window closes having received nothing at all is counted, and
+at three in a row the bus is declared silent: the cycle is abandoned and the port
+recycled rather than spending a budget on every remaining command. Any byte
+clears the count, since a partial or garbled reply is what the retries are for.
+
+Which spelling of the fan commands a given firmware answers to is learned once
+and then used alone. It is forgotten only when the box explicitly rejects it,
+never on a timeout -- a struggling bus is no evidence the name is wrong.
+
+Node serials are validated by shape and merged rather than replaced. That column
+carries status words as well as identifiers, and storing one of those as a serial
+was enough to flap the topology signature and re-run the startup probe on every
+cycle.
+
+The startup sensor probe and the first configuration read are kept in separate
+cycles, since each walks every node, and the config read cannot be postponed
+indefinitely.
+
+Diagnostics say how a command failed rather than only that it did, because the
+cases want different fixes and are otherwise indistinguishable: no echo means it
+never reached the box, an echo without a completion marker means the reply was
+cut off by the budget, and a marker without the expected token means the box
+answered something else. A command that succeeds using more than half its budget
+is logged with its duration, so the budgets stay measured.
+
+Published values are range-checked, and on an RH-capable node, either its
+humidity or its temperature latching bit-exact for a sustained window is
+treated as a hardware fault rather than data: the node is cycled through its
+full range, a minute at 100%, a minute at 0%, then a minute at 10%, before
+being released back to Auto -- the serial equivalent of the physical button
+press known to unstick it. A single step toward one end and back was tried
+first and confirmed live to fire correctly without ever clearing the fault;
+the full swing is what the button press actually does. Repeat attempts on
+the same node are gated behind a 45-minute cooldown: a longer one left a
+chronically re-latching node sitting visibly stuck for up to an hour between
+attempts, even though a single attempt completes in under three minutes and
+the node routinely re-shows a bit-exact value well before the cooldown is
+up. A latched temperature also needs to already be outside the plausible
+indoor range before it counts, since unlike humidity a real room can sit at
+one reading for a long time without anything being wrong.
+
+Upstream-Status: Inappropriate [WIP]
+---
+ CMakeLists.txt             |    1 +
+ hardware/DucoBoxSerial.cpp | 2259 ++++++++++++++++++++++++++++++++++++
+ hardware/DucoBoxSerial.h   |  311 +++++
+ main/RFXNames.cpp          |    2 +
+ main/RFXNames.h            |    1 +
+ main/mainworker.cpp        |    4 +
+ 6 files changed, 2578 insertions(+)
+ create mode 100644 hardware/DucoBoxSerial.cpp
+ create mode 100644 hardware/DucoBoxSerial.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1835493c8..8eae462fc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -260,6 +260,7 @@ hardware/DenkoviTCPDevices.cpp
+ hardware/DomoticzHardware.cpp
+ hardware/DomoticzInternal.cpp
+ hardware/DomoticzTCP.cpp
++hardware/DucoBoxSerial.cpp
+ hardware/Dummy.cpp
+ hardware/EcoCompteur.cpp
+ hardware/EcoDevices.cpp
+diff --git a/hardware/DucoBoxSerial.cpp b/hardware/DucoBoxSerial.cpp
+new file mode 100644
+index 000000000..d060702f8
+--- /dev/null
++++ b/hardware/DucoBoxSerial.cpp
+@@ -0,0 +1,2259 @@
++#include "stdafx.h"
++#include "DucoBoxSerial.h"
++
++#include "hardwaretypes.h"
++#include "../main/Helper.h"
++#include "../main/Logger.h"
++#include "../main/SQLHelper.h"
++
++#include <algorithm>
++#include <boost/exception/diagnostic_information.hpp>
++#include <cctype>
++#include <cmath>
++#include <functional>
++#include <map>
++#include <regex>
++#include <set>
++#include <sstream>
++
++/*
++ * Domoticz DucoBox serial hardware plugin (read-only telemetry).
++ *
++ * Design notes:
++ * - Talks to the Duco command shell over a configurable serial port (115200 8N1).
++ * - Polls network + nodeparaget and auto-creates native Domoticz devices via
++ *   SendTempHumSensor, SendAirQualitySensor, SendSwitch, and SendFanSensor.
++ * - Device IDs are derived from Duco node ids.
++ * - Parser is stream-oriented and tolerant of interleaved/garbled replies from
++ *   unsolicited Duco output.
++ *
++ * Protocol notes (validated against the DucoBox firmware `help` command output,
++ * 2026-07; see docs/duco-api-reference.md):
++ * - Sending `CoreLogLevel 0x10` on connect silences asynchronous log frames that
++ *   otherwise interleave with command output; OpenSerialDevice() does this to make
++ *   completion detection more reliable.
++ * - Terminal reply tokens: "done" / "failed" / "unknown cmd" /
++ *   "incorrect cmd arguments" / "--- end list ---"; per-node values follow "-->".
++ * - Parameter ids: 73 TEMPERATURE (deci-C), 74 CO2_AVERAGE_VAL (ppm),
++ *   75 HUM_SENSOR_VAL (centi-%). Full catalog in docs (nodeparalist).
++ * - This plugin is intentionally read-only.
++ *
++ * Known caveat: StableNodeIdForCapability() below hashes the node serial with
++ * std::hash, which is implementation-defined across toolchains/platforms. A
++ * deterministic hash (FNV-1a/CRC32) plus a persisted collision map would make
++ * device ids stable across rebuilds; left as-is here to avoid churning existing
++ * Domoticz device mappings.
++ *
++ * Stuck-RH remediation validated live 2026-07-18: a direct serial capture across
++ * an actual physical UC button press caught a valve's raw RH bit-exact flat for
++ * the whole pre-press window (with the valve pinned at 100% airflow), and both
++ * the airflow and the raw reading resumed moving immediately after the manual
++ * overrule -- confirming NodeSetOverrule (what this plugin issues automatically)
++ * has the same unsticking effect as the physical fix. The valve's paired UC's own
++ * independent RH sensor (when one exists) agreed with the valve's reading within
++ * ~0.2 points once unstuck, having disagreed by >30 points while stuck -- see
++ * TrackAndMaybeRemediateStuckHumidity's use of hasPairedUcRh below.
++ */
++
++namespace
++{
++	// Keep retry/poll constants explicit so noisy serial behavior can be tuned without
++	// changing parser code paths.
++	const int DUCO_RETRY_DELAY = 10;
++	const int DUCO_POLL_INTERVAL = 30;
++	// Raised from 4500ms once the diagnostics measured what commands actually take: a
++	// nodeparaget answered in 4433ms of the old 4500ms budget, i.e. 67ms of headroom,
++	// and two others failed with bytes present but no echo -- slow replies cut off
++	// rather than lost. 10000ms is ~2.3x the worst measured success, sized the same
++	// way the 20000ms bulk budget was, and it happens to be exactly what the Python
++	// plugin's reader has always defaulted to, so both plugins now agree on one
++	// number. Deliberately one global default rather than a constant per command: the
++	// slow-command log below surfaces anything that needs more, so there is no need to
++	// guess in advance which command that is.
++	const int DUCO_COMMAND_TIMEOUT_MS = 10000;
++	// Budget for the two commands that dump a whole node table. 4500ms is not enough
++	// for them: netwserial failed on every single poll cycle for as long as there are
++	// logs, and giving it three attempts instead of one changed nothing, because each
++	// attempt hit the same wall. The reply was arriving -- it simply arrived after the
++	// window closed, which is also how its tail ended up being parsed as the *next*
++	// command's answer. Retrying a reply that is merely slow cannot help; only waiting
++	// longer can. Worst case per failing command is one budget for netwserial and two
++	// for network, so ~20s and ~40s; both should normally answer far inside that, and
++	// the timing diagnostics below are there to show what the real margin is rather
++	// than leaving this number a guess forever.
++	const int DUCO_BULK_COMMAND_TIMEOUT_MS = 20000;
++	// A command that answers but uses more than this share of its budget is worth
++	// knowing about before it starts failing outright.
++	const int DUCO_SLOW_COMMAND_LOG_FRACTION = 2; // log when elapsed > budget/2
++	const int DUCO_COMMAND_IDLE_MS = 250;
++	const int DUCO_COMMAND_RETRY_DELAY_MS = 250;
++	// Quiet window held before talking to the box. The box streams a response at
++	// its own pace and can still be mid-sentence when the next command goes out;
++	// those trailing bytes then land in the new command's read window and get
++	// parsed as its answer. Pausing (and only then clearing the buffer) keeps the
++	// two apart. Costs one second per command -- see the note above PollCycle for
++	// what that does to the cycle length.
++	const int DUCO_INTER_COMMAND_PAUSE_MS = 1000;
++	// 'network' dumps the whole node table, by far the longest and slowest reply in
++	// the cycle, so it gets a wider berth on both sides rather than the standard one.
++	const int DUCO_NETWORK_QUIET_MS = 2000;
++	const int DUCO_MAX_RX_BUFFER = 65536;
++	// Tighter than before (was 10): during a sustained outage the poll cycle
++	// itself takes far longer than DUCO_POLL_INTERVAL (every command in the
++	// cycle times out in sequence -- netwserial, fanspeed, fanperformget,
++	// network -- so one cycle can take ~30s on its own), so a log-every-10th
++	// throttle made a system that actually kept retrying roughly once a
++	// minute look completely silent/stuck for many minutes at a time.
++	const int DUCO_NETWORK_ERROR_LOG_EVERY = 3;
++	// After this many consecutive full-cycle failures, force-close the
++	// serial device so Do_Work()'s existing reconnect path (isOpen() ==
++	// false -> wait DUCO_RETRY_DELAY -> OpenSerialDevice()) gets a genuinely
++	// fresh file descriptor/connection, rather than retrying forever against
++	// a connection that may itself be wedged at the OS/driver level and
++	// unable to self-recover just by resending commands on it.
++	const int DUCO_FORCE_RECONNECT_AFTER_FAILURES = 4;
++	// Consecutive command attempts returning *nothing at all* before the bus is
++	// declared silent and the port recycled. Sized against two measured shapes: an
++	// 8.4-minute outage in which 36 consecutive commands returned 0 bytes, and an
++	// isolated single-command 0-byte failure whose neighbouring cycles were healthy.
++	// Every short command sends one attempt per call and 'network' sends two, so an
++	// isolated hiccup reaches at most 2 and is tolerated; 3 is the smallest value
++	// that survives it while still tripping within a minute of a real outage instead
++	// of burning a timeout on every remaining command in the cycle.
++	const int DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT = 3;
++	// A learned command name that answers but yields nothing parseable this many times
++	// in a row is treated as a format change, and the alternatives get probed again.
++	const int DUCO_CACHED_VARIANT_PARSE_FAILURES = 3;
++	// How many cycles the writable-config read may be postponed to keep it out of the
++	// startup probe's cycle before it runs regardless.
++	const int DUCO_MAX_CONFIG_DEFERRALS = 3;
++	// A chronically-broken sensor (e.g. a permanently floating RH channel)
++	// would otherwise log every single poll cycle forever; log on first drop
++	// and periodically thereafter, same throttling shape as the network-fail
++	// streak above.
++	const int DUCO_FILTER_DROP_LOG_EVERY = 10;
++	// Writable config (setpoints/thresholds/capacity) is read in full on startup and on
++	// topology change, but otherwise barely changes, so cap the idle re-read cadence at
++	// once a week rather than never refreshing it at all.
++	const time_t DUCO_CONFIG_REFRESH_SECONDS = 7 * 24 * 3600;
++
++	const int DUCO_TEMP_PARAGET = 73;
++	const int DUCO_CO2_PARAGET = 74;
++	const int DUCO_RH_PARAGET = 75;
++
++	// Writable-config device-id scheme. The id bytes are chosen so WriteToHardware
++	// can route a UI change back to the exact serial write command:
++	//   id1 = marker, id2 = ConfigGroup, id3 = nodeId, id4 = config index.
++	const uint8_t DUCO_CFG_MARKER = 0xDC;
++	// Conservative publish bounds: keeps obvious line noise/sentinel values out of
++	// Domoticz while still accepting normal operating ranges.
++	const int DUCO_MIN_CO2_PPM = 50;
++	// Was 5000, which is above the whole plausible RH-raw range (1500-10000 centi-
++	// percent), so a humidity reading misparsed as CO2 sailed through: 2026-07-23
++	// published 4271-4984 ppm spikes into history between 405 ppm neighbours, which
++	// were really 42.71-49.84% RH. AfterCommandEcho() fixes the misparse itself;
++	// this is the backstop. Indoor CO2 above 3000 ppm is already far past any
++	// ventilation setpoint, and rejected values are logged rather than dropped
++	// silently, so a genuine excursion is still visible.
++	const int DUCO_MAX_CO2_PPM = 3000;
++	const float DUCO_MIN_TEMP_C = -40.0F;
++	const float DUCO_MAX_TEMP_C = 60.0F;
++	// Real indoor RH essentially never reads this low in practice (confirmed
++	// 2026-07-18: node 22's dead sensor produced an implausible 4% reading that
++	// the previous floor of 3 let straight through as "valid").
++	const int DUCO_MIN_HUMIDITY = 15;
++	const int DUCO_MAX_HUMIDITY = 100;
++
++	// Stuck-RH-sensor remediation (see docs/duco-api-reference.md and
++	// DucoBoxSerial.h). Duration threshold validated against 6 months of real
++	// Influx history: a shorter window fires constantly on ordinary
++	// shower-driven humidity plateaus. Deliberately no minimum-percent floor --
++	// a faulty valve's raw reading can latch at any level, not just a high one.
++	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS = 20 * 60;
++	// Shorter thresholds used when a corroborating signal is present (see
++	// TrackAndMaybeRemediateStuckHumidity) -- confirmed live 2026-07-18 that a
++	// stuck valve is reliably also pinned at ~100% airflow, and that its paired
++	// UC's own independent sensor disagrees sharply while it's stuck.
++	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS_FAST = 5 * 60;
++	const time_t DUCO_RH_STUCK_MIN_DURATION_SECONDS_UC_CONFIRM = 3 * 60;
++	const int DUCO_RH_STUCK_FLOW_PINNED_PCT = 95;
++	// Observed live disagreement while genuinely stuck was >30 points (87.74%
++	// vs. 53.10%); comfortably above normal poll-to-poll/sensor-placement
++	// variation between a valve and its UC.
++	const int DUCO_RH_STUCK_UC_DISAGREEMENT_PCT = 20;
++	// Each remediation step (100%, then 0%, then 10%) is held this long before
++	// moving to the next one; see OverruleRemediationPhase.
++	const time_t DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS = 60;
++	const time_t DUCO_RH_STUCK_COOLDOWN_SECONDS = 45 * 60;
++	const int DUCO_RH_STUCK_OVERRULE_HIGH_PCT = 100;
++	const int DUCO_RH_STUCK_OVERRULE_LOW_PCT = 0;
++	const int DUCO_RH_STUCK_OVERRULE_SETTLE_PCT = 10;
++	const int DUCO_OVERRULE_RELEASE = 255;
++
++	// Stuck-temperature remediation (see TrackAndMaybeRemediateStuckTemperature).
++	// Confirmed live 2026-07-19 on node 2, and again 2026-07-26: the same
++	// NodeSetOverrule fix that clears a stuck RH reading also clears a stuck raw
++	// 'temp' column reading -- both come from the same network-row read as the
++	// RH value (see GetNodeTemperature). Unlike humidity (where a genuinely
++	// plausible level really can persist, e.g. a real shower), a real indoor
++	// temperature staying bit-exact for 20+ minutes is completely ordinary on
++	// its own, so this additionally requires the latched value to already fail
++	// the DUCO_MIN_TEMP_C/DUCO_MAX_TEMP_C plausibility check before treating it
++	// as a fault. Episodes seen so far: bit-exact 774, 767 and 774 again
++	// (77.4C/76.7C/77.4C), all well outside the plausible indoor range. No
++	// corroborating fast-path signal validated yet (unlike humidity's
++	// flow-pinned/UC-disagreement fast paths), so this reuses the same
++	// conservative 20-minute baseline.
++	const time_t DUCO_TEMP_STUCK_MIN_DURATION_SECONDS = 20 * 60;
++
++}
++
++namespace
++{
++int HumidityStatus(const int humidity)
++{
++	if (humidity <= 25)
++		return 2; // Dry
++	if (humidity >= 60)
++		return 3; // Wet
++	return 1; // Comfort
++}
++}
++
++CDucoBoxSerial::CDucoBoxSerial(const int ID, const std::string& devname) :
++	m_szSerialPort(devname)
++{
++	m_HwdID = ID;
++}
++
++bool CDucoBoxSerial::WriteToHardware(const char* pdata, const unsigned char length)
++{
++	if (pdata == nullptr || length < 3)
++		return false;
++
++	const uint8_t packetType = static_cast<uint8_t>(pdata[1]);
++
++	// Continuous parameters (setpoints, thresholds, capacity, fan-level %).
++	if (packetType == pTypeSetpoint)
++	{
++		const auto* sp = reinterpret_cast<const _tSetpoint*>(pdata);
++		if (sp->subtype != sTypeSetpoint || sp->id1 != DUCO_CFG_MARKER)
++			return false;
++		const auto group = static_cast<ConfigGroup>(sp->id2);
++		const int nodeId = sp->id3;
++		const int index = sp->id4;
++		int raw = static_cast<int>(std::lround(sp->value));
++		// Vent-ctrl temperature thresholds are stored in 0.1 C; UI shows whole C.
++		if (group == CfgVentCtrl && (index == 2 || index == 3))
++			raw = static_cast<int>(std::lround(sp->value * 10.0F));
++		return WriteConfigValue(group, nodeId, index, raw);
++	}
++
++	// Discrete on/off parameters published as selector switches.
++	if (packetType == pTypeGeneralSwitch)
++	{
++		const auto* gs = reinterpret_cast<const _tGeneralSwitch*>(pdata);
++		if (gs->subtype != sSwitchTypeSelector)
++			return false;
++		const auto id = static_cast<uint32_t>(gs->id);
++		if (((id >> 24) & 0xFF) != DUCO_CFG_MARKER)
++			return false;
++		const auto group = static_cast<ConfigGroup>((id >> 16) & 0xFF);
++		const int nodeId = (id >> 8) & 0xFF;
++		const int index = id & 0xFF;
++		const int value = gs->level / 10; // selector levels 0/10 -> 0/1
++		return WriteConfigValue(group, nodeId, index, value);
++	}
++
++	return false;
++}
++
++bool CDucoBoxSerial::StartHardware()
++{
++	RequestStart();
++
++	m_retrycntr = DUCO_RETRY_DELAY;
++
++	m_thread = std::make_shared<std::thread>([this] { Do_Work(); });
++	SetThreadNameInt(m_thread->native_handle());
++	return (m_thread != nullptr);
++}
++
++bool CDucoBoxSerial::StopHardware()
++{
++	if (m_thread)
++	{
++		RequestStop();
++		m_thread->join();
++		m_thread.reset();
++	}
++	m_bIsStarted = false;
++	return true;
++}
++
++bool CDucoBoxSerial::OpenSerialDevice()
++{
++	try
++	{
++		Log(LOG_STATUS, "DucoBox: Using serial port: %s", m_szSerialPort.c_str());
++		open(
++			m_szSerialPort,
++			m_iBaudRate,
++			boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none),
++			boost::asio::serial_port_base::character_size(8),
++			boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::none),
++			boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
++	}
++	catch (boost::exception& e)
++	{
++		Log(LOG_ERROR, "DucoBox: Error opening serial port");
++#ifdef _DEBUG
++		Log(LOG_ERROR, "-----------------\n%s\n-----------------", boost::diagnostic_information(e).c_str());
++#else
++		(void)e;
++#endif
++		return false;
++	}
++	catch (...)
++	{
++		Log(LOG_ERROR, "DucoBox: Error opening serial port");
++		return false;
++	}
++
++	ClearRxBuffer();
++	// Mandatory, not defensive: SendCommand() fails fast while this streak is at the
++	// limit, so if it were not cleared here the very first trip would latch and no
++	// command would ever be sent again.
++	m_silentAttemptStreak = 0;
++	m_portOpenedAt = mytime(nullptr);
++	m_bIsStarted = true;
++	setReadCallback([this](auto d, auto l) { readCallback(d, l); });
++	sOnConnected(this);
++
++	// Silence asynchronous log frames so they don't interleave with command replies
++	// and desync completion detection. Fire-and-forget; harmless (returns
++	// "Unknown Cmd") on firmware that lacks the command.
++	write(std::string("CoreLogLevel 0x10\r"));
++
++	return true;
++}
++
++void CDucoBoxSerial::Do_Work()
++{
++	int secCounter = 0;
++	bool firstCycle = true;
++
++	Log(LOG_STATUS, "DucoBox: Worker started");
++
++	while (!IsStopRequested(1000))
++	{
++		secCounter++;
++		if (secCounter % 12 == 0)
++			m_LastHeartbeat = mytime(nullptr);
++
++		if (!isOpen())
++		{
++			// A bus that went silent seconds after the last open is not obviously helped
++			// by reopening it immediately, so back off as trips repeat rather than
++			// hammering open/close. Capped so recovery still happens promptly.
++			const int retryDelay = DUCO_RETRY_DELAY << std::min(m_consecutiveSilentTrips, 3);
++			if (m_retrycntr == 0)
++				Log(LOG_STATUS, "DucoBox: retrying serial setup in %d seconds...", retryDelay);
++
++			m_retrycntr++;
++			if (m_retrycntr >= retryDelay)
++			{
++				m_retrycntr = 0;
++				if (OpenSerialDevice())
++					firstCycle = true;
++			}
++			continue;
++		}
++
++		if (firstCycle || (secCounter % DUCO_POLL_INTERVAL) == 0)
++		{
++			firstCycle = false;
++			PollCycle();
++		}
++	}
++
++	terminate();
++	Log(LOG_STATUS, "DucoBox: Worker stopped");
++}
++
++void CDucoBoxSerial::readCallback(const char* data, size_t len)
++{
++	if (!m_bIsStarted || !m_bEnableReceive)
++		return;
++
++	std::lock_guard<std::mutex> lock(m_rxMutex);
++	// Duco can emit async data at any moment; keep a rolling raw buffer that command
++	// readers can snapshot without assuming strict request/response framing.
++	m_rxBuffer.append(data, len);
++	if ((int)m_rxBuffer.size() > DUCO_MAX_RX_BUFFER)
++		m_rxBuffer.erase(0, m_rxBuffer.size() - DUCO_MAX_RX_BUFFER);
++}
++
++// Firmware naming differs across models, so these commands have to be probed. What
++// they should not need is probing on every cycle forever: a non-answering spelling
++// costs a quiet window plus a round trip when the bus is healthy, and a full budget
++// each when it is not -- seven of them per cycle across the two command families,
++// measured at roughly 33s on a bad cycle.
++//
++// The learned name is dropped only on a definitive negative: the box answering
++// "unknown cmd" to the name it previously accepted. A timeout or silence does not
++// clear it, because a struggling bus is no evidence the name is wrong, and
++// re-probing the whole list under those conditions is exactly the waste this
++// removes. A firmware change that answers but alters the reply format is caught by
++// the consecutive-unparseable counter instead.
++bool CDucoBoxSerial::RunCachedVariant(const std::vector<std::string>& variants, std::string& cache,
++				      int& parseFailures, std::string& rawOut,
++				      const std::function<bool(const std::string&)>& parseAndPublish)
++{
++	std::vector<std::string> order;
++	if (!cache.empty())
++		order.push_back(cache);
++	else
++		order = variants;
++
++	for (const auto& cmd : order)
++	{
++		if (!SendCommand(cmd, "", rawOut, 1))
++			continue;
++
++		const std::string low = ToLower(rawOut);
++		if (Contains(low, "unknown cmd") || Contains(low, "unknown command"))
++		{
++			// Definitive: this spelling is wrong. If it was the cached one the
++			// firmware has changed under us, so forget it and let the next cycle
++			// probe the full list again.
++			if (!cache.empty() && cmd == cache)
++			{
++				Log(LOG_STATUS, "DucoBox: '%s' is no longer accepted; will probe the alternatives again", cache.c_str());
++				cache.clear();
++				parseFailures = 0;
++			}
++			continue;
++		}
++
++		if (parseAndPublish(rawOut))
++		{
++			if (cache.empty())
++			{
++				cache = cmd;
++				Log(LOG_STATUS, "DucoBox: this firmware answers '%s'; caching it for later cycles", cmd.c_str());
++			}
++			parseFailures = 0;
++			return true;
++		}
++
++		// Answered, not rejected, but unreadable. Tolerate a couple in case it is
++		// transient corruption rather than a format change.
++		if (!cache.empty() && cmd == cache && ++parseFailures >= DUCO_CACHED_VARIANT_PARSE_FAILURES)
++		{
++			Log(LOG_ERROR, "DucoBox: '%s' answered %d times without a value we could read; re-probing the alternatives",
++			    cache.c_str(), parseFailures);
++			cache.clear();
++			parseFailures = 0;
++		}
++	}
++	return false;
++}
++
++bool CDucoBoxSerial::AbortCycleIfBusSilent()
++{
++	if (m_silentAttemptStreak < DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT)
++		return false;
++
++	// Report how long after the port was opened the bus went quiet. The one measured
++	// outage began 13 seconds after an open, which is suggestive but not evidence --
++	// this is what will settle whether opening the port is implicated, rather than
++	// adding a settling delay on a hunch.
++	const long sinceOpenSec = m_portOpenedAt ? (long)(mytime(nullptr) - m_portOpenedAt) : -1;
++	if (m_consecutiveSilentTrips == 0 || (m_consecutiveSilentTrips % DUCO_NETWORK_ERROR_LOG_EVERY) == 0)
++		Log(LOG_ERROR, "DucoBox: bus silent for %d consecutive attempts %lds after the port was opened; abandoning the cycle and recycling the port (trip %d)",
++		    (int)m_silentAttemptStreak, sinceOpenSec, m_consecutiveSilentTrips + 1);
++	++m_consecutiveSilentTrips;
++
++	// Hand over to Do_Work()'s existing isOpen()-false path: it waits, reopens with a
++	// fresh descriptor, clears the streak and runs a full cycle immediately. Nothing
++	// here needs to duplicate that.
++	// close(), mirroring the existing force-reconnect call site -- terminate() is
++	// Do_Work()'s shutdown path and would tear down more than the connection. Guarded
++	// because AsyncSerial::close() throws when an error status is already latched, and
++	// letting that escape here would take the worker thread down with it.
++	try
++	{
++		close();
++	}
++	catch (...)
++	{
++	}
++	return true;
++}
++
++// A cycle issues roughly 50-60 serial commands (one 'network' table plus two or
++// three nodeparaget reads per node), and DUCO_INTER_COMMAND_PAUSE_MS adds a second
++// to each, so a measured 47-87s cycle becomes closer to two minutes. That is the
++// intended trade: the box is a slow single-master bus and rushing it produced
++// mis-attributed readings. DUCO_POLL_INTERVAL is a floor between cycles, not a
++// period -- when a cycle outruns it the next one simply starts at the following
++// multiple. If the resulting sensor cadence is ever too slow, cache which
++// fanspeed/FanPerformGet command name this firmware answers to instead of
++// re-probing the variants every cycle; that is wasted traffic, unlike the pauses.
++void CDucoBoxSerial::PollCycle()
++{
++	// Fanspeed goes first, ahead of netwserial/network: it's the cheapest
++	// command in the cycle (single value, no retries beyond 1) and doesn't
++	// depend on either of them, so it should get a fresh shot at succeeding
++	// before anything slower/bigger has a chance to eat into this cycle's
++	// time budget on a struggling link.
++	std::string fanRaw;
++	const bool fanOk = RunCachedVariant(
++		{ "fanspeed", "FanSpeed", "fangetspeed", "FanGetSpeed" }, m_fanSpeedCmd, m_fanSpeedParseFailures, fanRaw,
++		[this](const std::string& raw) {
++			int rpm = 0;
++			if (!ParseFanRpm(raw, rpm))
++				return false;
++			SendFanSensor(StableNodeIdForCapability(1, SensorCapability::FanSpeed), 255, rpm, "Duco Box Fan Speed");
++			return true;
++		});
++	if (!fanOk)
++		LogFilteredValue("fanspeed command failed (all variants)", 1, 0);
++
++	if (AbortCycleIfBusSilent())
++		return;
++
++	RefreshNodeSerials();
++	if (AbortCycleIfBusSilent())
++		return;
++	CheckPendingOverruleRemediation();
++
++	std::string fanPerformRaw;
++	// FanPerformGet reports fan performance including instantaneous power draw
++	// ("Power Now : N W"); publish it as a box-level Usage/Wattage device.
++	const bool powerOk = RunCachedVariant(
++		{ "FanPerformGet", "fanperformget", "FanPerform" }, m_fanPerformCmd, m_fanPerformParseFailures, fanPerformRaw,
++		[this](const std::string& raw) {
++			int watts = 0;
++			if (!ParseFanPower(raw, watts))
++				return false;
++			SendWattMeter(StableNodeIdForCapability(1, SensorCapability::Power), 1, 255, (float)watts, "Duco Box Power");
++			return true;
++		});
++	if (!powerOk)
++		LogFilteredValue("power command failed (all variants)", 1, 0);
++
++	if (AbortCycleIfBusSilent())
++		return;
++
++	std::string networkRaw;
++	std::vector<NodeInfo> nodes;
++	// Two attempts on the long budget: the first covers a slow-but-complete reply,
++	// the second a genuinely garbled one. Bounded at ~40s in the worst case.
++	if (SendCommand("network", "start list", networkRaw, 2, DUCO_BULK_COMMAND_TIMEOUT_MS))
++	{
++		if (m_networkFailStreak > 0)
++		{
++			Log(LOG_STATUS, "DucoBox: network command recovered after %d failures", m_networkFailStreak);
++			m_networkFailStreak = 0;
++		}
++
++		nodes = ParseNetworkRows(networkRaw);
++		m_lastKnownNodes = nodes;
++		m_lastKnownNodesSerialSnapshot = m_nodeSerials;
++	}
++	else
++	{
++		m_networkFailStreak++;
++		// Serial links can flap for extended periods; log on first and periodic
++		// failures so operators still get signal without log flooding.
++		if (m_networkFailStreak == 1 || (m_networkFailStreak % DUCO_NETWORK_ERROR_LOG_EVERY) == 0)
++			Log(LOG_ERROR, "DucoBox: network command failed (consecutive failures: %d)", m_networkFailStreak);
++
++		if (m_networkFailStreak >= DUCO_FORCE_RECONNECT_AFTER_FAILURES)
++		{
++			Log(LOG_ERROR, "DucoBox: forcing serial reconnect after %d consecutive failures", m_networkFailStreak);
++			close();
++			m_networkFailStreak = 0;
++			return;
++		}
++
++		// The bulk 'network' table itself failed, but netwserial (read
++		// independently, earlier this same cycle, via RefreshNodeSerials) is a
++		// much lighter command and may still be succeeding. If it reports the
++		// exact same node serials as our last good network parse, the physical
++		// topology almost certainly hasn't changed -- keep polling individual
++		// nodes against the cached topology rather than going completely dark
++		// for the whole cycle. Node-level fields sourced only from the network
++		// row itself (flow%, override state) go stale in this fallback path;
++		// RH/CO2/temp below still come from fresh per-node nodeparaget reads
++		// either way, so the data that actually needs freshness keeps flowing.
++		if (!m_lastKnownNodes.empty() && m_nodeSerials == m_lastKnownNodesSerialSnapshot)
++		{
++			Log(LOG_STATUS, "DucoBox: reusing last-known topology (%zu nodes, serials unchanged) while network command recovers",
++				m_lastKnownNodes.size());
++			nodes = m_lastKnownNodes;
++		}
++		else
++		{
++			return;
++		}
++	}
++
++	std::stringstream topo;
++	// A compact topology signature lets us reprobe only when node composition or
++	// node identity changed, avoiding unnecessary startup-level probing every cycle.
++	for (const auto& node : nodes)
++		topo << node.nodeId << ':' << ToLower(node.type) << ';';
++	topo << '|';
++	for (const auto& it : m_nodeSerials)
++		topo << it.first << '=' << it.second << ';';
++	const std::string topologySignature = topo.str();
++
++	const bool topologyChanged = topologySignature != m_lastTopologySignature;
++	const bool probeRanThisCycle = !m_startupProbeDone || topologyChanged;
++	if (topologyChanged)
++		m_configReadPending = true;
++	if (probeRanThisCycle)
++	{
++		ProbeStartupSensors(nodes);
++		m_startupProbeDone = true;
++		m_lastTopologySignature = topologySignature;
++	}
++
++	const time_t now = mytime(nullptr);
++	// Publish the writable configuration (setpoints/thresholds/capacity/fan levels) on
++	// startup, whenever the topology changes (a new/replaced node needs its config read
++	// at least once), and otherwise at most once a week: these values are re-read after
++	// each write already, and the box's firmware doesn't change them on its own, so a
++	// per-cycle refresh would just be needless serial traffic.
++	// Not in the same cycle as the startup probe. Both walk every node, and with the
++	// budgets above a first cycle doing both took roughly half an hour on a struggling
++	// bus. Deferring by one cycle costs nothing -- config devices simply appear a
++	// cycle later on a fresh install -- and keeps the larger default budget from
++	// re-inflating startup. The pending flag rather than the topologyChanged test the
++	// condition used before: that flag is only true for the cycle the change is seen
++	// in, so gating on it directly would skip the re-read entirely instead of
++	// deferring it.
++	// The deferral is capped. Gating purely on "the probe didn't run this cycle" means
++	// a topology signature that keeps changing starves the config read completely --
++	// which is exactly what happened when two nodes' serial read as "Failed" and the
++	// signature flapped every cycle. Deferring is a courtesy to the first cycle, not a
++	// licence to never read config at all.
++	if (m_configReadPending && probeRanThisCycle)
++		++m_configDeferrals;
++	const bool deferralExhausted = m_configDeferrals >= DUCO_MAX_CONFIG_DEFERRALS;
++	if ((!probeRanThisCycle || deferralExhausted)
++	    && (m_configReadPending || (now - m_lastConfigReadTime) >= DUCO_CONFIG_REFRESH_SECONDS))
++	{
++		m_configDeferrals = 0;
++		PublishWritableConfig(nodes);
++		m_configProbeDone = true;
++		m_configReadPending = false;
++		m_lastConfigReadTime = now;
++	}
++
++	if (AbortCycleIfBusSilent())
++		return;
++
++	std::set<int> seenNodes;
++
++	// Valve node id -> its paired UC's node id, for UCs that carry their own RH
++	// sensor and report an 'asso' pointing at the valve. Used as a corroborating
++	// signal in TrackAndMaybeRemediateStuckHumidity: the UC's independent sensor
++	// reading a materially different value than the valve is strong evidence the
++	// valve's own reading is stuck, well before the time-based threshold fires.
++	std::map<int, int> ucRhByValve;
++	for (const auto& node : nodes)
++	{
++		const std::string t = ToLower(node.type);
++		if (node.hasAsso && Contains(t, "uc") && Contains(t, "rh"))
++			ucRhByValve[node.assoNodeId] = node.nodeId;
++	}
++
++	for (const auto& node : nodes)
++	{
++		seenNodes.insert(node.nodeId);
++		const std::string typeUpper = ToLower(node.type);
++		const std::string displayName = NodeName(node);
++		auto serialIt = m_nodeSerials.find(node.nodeId);
++		if (serialIt != m_nodeSerials.end() && !serialIt->second.empty())
++		{
++			auto publishedIt = m_lastPublishedNodeSerialText.find(node.nodeId);
++			// Text devices are static identifiers; only publish on change to avoid
++			// unnecessary DB writes and event churn in Domoticz.
++			if (publishedIt == m_lastPublishedNodeSerialText.end() || publishedIt->second != serialIt->second)
++			{
++				SendTextSensor(
++					StableNodeIdForCapability(node.nodeId, SensorCapability::SerialText),
++					1,
++					255,
++					serialIt->second,
++					displayName + " Serial");
++				m_lastPublishedNodeSerialText[node.nodeId] = serialIt->second;
++			}
++		}
++		SensorProbeResult cachedProbe;
++		auto cacheIt = m_sensorProbeCache.find(node.nodeId);
++		if (cacheIt != m_sensorProbeCache.end())
++			cachedProbe = cacheIt->second;
++
++		if (Contains(typeUpper, "switch"))
++		{
++			const std::string infoLow = ToLower(node.info);
++			bool isOn = !(Contains(infoLow, "off") || Contains(infoLow, "fade"));
++			SendSwitch(StableNodeIdForCapability(node.nodeId, SensorCapability::SwitchState), 1, 255, isOn, 0, displayName, m_Name);
++		}
++
++		if ((Contains(typeUpper, "vlv") || Contains(typeUpper, "clima") || Contains(typeUpper, "box")) && node.hasFlowPercent)
++		{
++			if (node.flowPercent >= 0 && node.flowPercent <= 100)
++			{
++				SendPercentageSensor(
++					StableNodeIdForCapability(node.nodeId, SensorCapability::AirflowPercent),
++					1,
++					255,
++					(float)node.flowPercent,
++					displayName + " Airflow");
++
++				// "debiet" (Dutch: flow) = the node's rated capacity scaled by its
++				// current airflow position%, in the same m3/h unit as the capacity.
++				int cachedCapacity = -1;
++				{
++					std::lock_guard<std::mutex> cacheLock(m_nodeConfigCacheMutex);
++					const auto capIt = m_nodeCapacityM3h.find(node.nodeId);
++					if (capIt != m_nodeCapacityM3h.end())
++						cachedCapacity = capIt->second;
++				}
++				if (cachedCapacity >= 0)
++				{
++					const float flow = (float)cachedCapacity * ((float)node.flowPercent / 100.0F);
++					SendCustomSensor(
++						StableNodeIdForCapability(node.nodeId, SensorCapability::Flow),
++						1,
++						255,
++						flow,
++						displayName + " Flow",
++						"m3/h");
++				}
++			}
++		}
++
++		// The network row's own stat/cntdwn/ovrl columns already carry runtime
++		// override state for free (valves/CLIMA/box only -- see NodeInfo::hasOverrideState);
++		// publish them alongside Airflow/Flow rather than requiring a separate read.
++		if (node.hasOverrideState)
++		{
++			// A Selector Switch (Auto/Manual 1/2/3) is a more natural fit than a plain
++			// text sensor for this small, fixed enum -- and avoids two redundant
++			// devices carrying the same information in different widgets.
++			const int modeLevel = StatToSelectorLevel(node.overrideState);
++			if (modeLevel >= 0)
++			{
++				SendSelectorSwitch(
++					StableNodeIdForCapability(node.nodeId, SensorCapability::Mode),
++					1,
++					std::to_string(modeLevel),
++					displayName + " Mode",
++					0,
++					false,
++					"Auto|Manual 1|Manual 2|Manual 3",
++					"",
++					false,
++					"");
++			}
++
++			if (node.hasCntdwn)
++			{
++				SendCustomSensor(
++					StableNodeIdForCapability(node.nodeId, SensorCapability::Countdown),
++					1,
++					255,
++					(float)node.cntdwnRaw,
++					displayName + " Override Countdown",
++					"s");
++			}
++
++			if (node.hasOvrl)
++			{
++				const bool overrideActive = (node.ovrlRaw != DUCO_OVERRULE_RELEASE);
++				SendSwitch(
++					StableNodeIdForCapability(node.nodeId, SensorCapability::OverrideActive),
++					1,
++					255,
++					overrideActive,
++					0,
++					displayName + " Override Active",
++					m_Name);
++			}
++		}
++
++		const bool hasRHCapability = cachedProbe.hasRH || Contains(typeUpper, "rh");
++		const bool hasCO2Capability = cachedProbe.hasCO2 || Contains(typeUpper, "co2");
++
++		if (hasRHCapability && hasCO2Capability)
++		{
++			Log(LOG_NORM, "DucoBox: Node %d reports both RH and CO2 capabilities; publishing both", node.nodeId);
++		}
++
++		bool hasPublishedTempHum = false;
++		const bool suppressStandaloneTemp = hasRHCapability;
++
++		if (hasRHCapability)
++		{
++			int tempRaw = 0;
++			int rhRaw = 0;
++			if (GetNodeTemperature(node, tempRaw) && ReadNodeParameter(node.nodeId, DUCO_RH_PARAGET, rhRaw))
++			{
++				const bool flowPinnedHigh = node.hasFlowPercent && node.flowPercent >= DUCO_RH_STUCK_FLOW_PINNED_PCT;
++
++				bool hasPairedUcRh = false;
++				int pairedUcRhRaw = 0;
++				const auto ucIt = ucRhByValve.find(node.nodeId);
++				if (ucIt != ucRhByValve.end())
++					hasPairedUcRh = ReadNodeParameter(ucIt->second, DUCO_RH_PARAGET, pairedUcRhRaw);
++
++				TrackAndMaybeRemediateStuckHumidity(node.nodeId, rhRaw, flowPinnedHigh, hasPairedUcRh, pairedUcRhRaw);
++				TrackAndMaybeRemediateStuckTemperature(node.nodeId, tempRaw);
++
++				const float tempC = tempRaw / 10.0F;
++				const int humidity = (int)std::lround(rhRaw / 100.0);
++				const bool humidityValid = humidity >= DUCO_MIN_HUMIDITY && humidity <= DUCO_MAX_HUMIDITY;
++				const bool tempValid = tempC > DUCO_MIN_TEMP_C && tempC < DUCO_MAX_TEMP_C;
++				// RH nodes are treated as a combined signal: only publish TempHum when
++				// both channels look valid to avoid creating partially bogus sensors.
++				if (humidityValid && tempValid)
++				{
++					if (ShouldPublishTemperature(node.nodeId, tempC))
++					{
++						SendTempHumSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::TempHum), 255, tempC, humidity, displayName + " TempHum");
++						hasPublishedTempHum = true;
++						MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::TempHum);
++					}
++				}
++				else
++				{
++					if (!humidityValid)
++						LogFilteredValue("humidity out of range", node.nodeId, rhRaw);
++					if (!tempValid)
++						LogFilteredValue("temperature out of range", node.nodeId, tempRaw);
++
++					// Still create the device on the very first encounter, even with
++					// a flagged reading, so a sensor that has been broken since day
++					// one is at least visible/discoverable in Domoticz -- every cycle
++					// after this one goes back to full filtering as normal.
++					if (MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::TempHum))
++					{
++						SendTempHumSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::TempHum), 255, tempC, humidity, displayName + " TempHum");
++						hasPublishedTempHum = true;
++						Log(LOG_NORM, "DucoBox: node %d creating TempHum device despite flagged reading (first-ever encounter)", node.nodeId);
++					}
++				}
++			}
++		}
++
++		if (hasCO2Capability)
++		{
++			int co2ppm = 0;
++			const bool co2Read = ReadNodeParameter(node.nodeId, DUCO_CO2_PARAGET, co2ppm);
++			const bool co2Valid = co2Read && co2ppm >= DUCO_MIN_CO2_PPM && co2ppm <= DUCO_MAX_CO2_PPM;
++			// Discard clearly invalid CO2 values so transient parser noise does not
++			// push extreme spikes into history/automation.
++			if (co2Valid)
++			{
++				// CO2 is a concentration (ppm), not a VOC index -- pTypeAirQuality's
++				// sTypeVoc subtype is what BasePush.cpp's InfluxDB exporter maps to
++				// wording "Concentration"/unit "ppm" despite the "Voc" name, so this
++				// is the correct device type for raw ppm. A generic Custom Sensor was
++				// used here previously on the mistaken assumption that AirQuality/Voc
++				// meant a VOC index specifically -- that silently pushed CO2 history
++				// into InfluxDB's "Percentage" measurement instead of "Concentration",
++				// breaking continuity with domoticz-gateway's existing CO2 history for
++				// the same physical sensors. SendAirQualitySensor's NodeID/ChildID are
++				// both uint8_t, narrower than StableKey16ForCapability's 16-bit output,
++				// so the key is split across both params rather than truncated to keep
++				// full uniqueness across all CO2-capable nodes.
++				const uint16_t stableKey = StableKey16ForCapability(node.nodeId, SensorCapability::CO2);
++				SendAirQualitySensor(
++					static_cast<uint8_t>(stableKey >> 8),
++					static_cast<uint8_t>(stableKey & 0xFF),
++					255,
++					co2ppm,
++					displayName + " CO2");
++				MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::CO2);
++			}
++			else if (co2Read)
++			{
++				LogFilteredValue("CO2 out of range", node.nodeId, co2ppm);
++
++				// Still create the device on first-ever encounter, even with a
++				// flagged reading -- see the matching TempHum comment above.
++				if (MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::CO2))
++				{
++					const uint16_t stableKey = StableKey16ForCapability(node.nodeId, SensorCapability::CO2);
++					SendAirQualitySensor(
++						static_cast<uint8_t>(stableKey >> 8),
++						static_cast<uint8_t>(stableKey & 0xFF),
++						255,
++						co2ppm,
++						displayName + " CO2");
++					Log(LOG_NORM, "DucoBox: node %d creating CO2 device despite flagged reading (first-ever encounter)", node.nodeId);
++				}
++			}
++			int tempRaw = 0;
++			// If TempHum already exists for this node, suppress standalone temperature
++			// from the CO2 path to prevent duplicate temperature children.
++			if (!suppressStandaloneTemp && !hasPublishedTempHum && GetNodeTemperature(node, tempRaw))
++			{
++				const float tempC = tempRaw / 10.0F;
++				const bool tempValid = tempC > DUCO_MIN_TEMP_C && tempC < DUCO_MAX_TEMP_C;
++				if (tempValid && ShouldPublishTemperature(node.nodeId, tempC))
++				{
++					SendTempSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::Temperature), 255, tempC, displayName + " Temperature");
++					MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::Temperature);
++				}
++				else if (!tempValid)
++				{
++					LogFilteredValue("temperature out of range", node.nodeId, tempRaw);
++					if (MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::Temperature))
++					{
++						SendTempSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::Temperature), 255, tempC, displayName + " Temperature");
++						Log(LOG_NORM, "DucoBox: node %d creating Temperature device despite flagged reading (first-ever encounter)", node.nodeId);
++					}
++				}
++			}
++			continue;
++		}
++
++		if (!suppressStandaloneTemp && cachedProbe.hasTemp)
++		{
++			int tempRaw = 0;
++			if (GetNodeTemperature(node, tempRaw))
++			{
++				const float tempC = tempRaw / 10.0F;
++				const bool tempValid = tempC > DUCO_MIN_TEMP_C && tempC < DUCO_MAX_TEMP_C;
++				if (tempValid && ShouldPublishTemperature(node.nodeId, tempC))
++				{
++					SendTempSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::Temperature), 255, tempC, displayName + " Temperature");
++					MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::Temperature);
++				}
++				else if (!tempValid)
++				{
++					LogFilteredValue("temperature out of range", node.nodeId, tempRaw);
++					if (MarkDeviceCreatedIfFirst(node.nodeId, SensorCapability::Temperature))
++					{
++						SendTempSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::Temperature), 255, tempC, displayName + " Temperature");
++						Log(LOG_NORM, "DucoBox: node %d creating Temperature device despite flagged reading (first-ever encounter)", node.nodeId);
++					}
++				}
++			}
++		}
++	}
++
++	for (auto it = m_lastPublishedNodeSerialText.begin(); it != m_lastPublishedNodeSerialText.end();)
++	{
++		// Prune cache entries for nodes that disappeared so stale state does not
++		// suppress future publishes when ids are reused.
++		if (seenNodes.find(it->first) == seenNodes.end())
++			it = m_lastPublishedNodeSerialText.erase(it);
++		else
++			++it;
++	}
++}
++
++void CDucoBoxSerial::RefreshNodeSerials()
++{
++	std::string netwSerialRaw;
++	// One attempt, long budget. Giving this three attempts at the normal budget was
++	// tried and measured: it still failed on every single poll cycle, because the
++	// reply is slow rather than lost and each attempt hit the same wall. Retrying
++	// only multiplied the wasted time. The diagnostics in SendCommandLocked report
++	// the real duration, so if 20s turns out to be wrong the log will say so instead
++	// of this quietly failing forever the way it has been.
++	if (!SendCommand("netwserial", "start list", netwSerialRaw, 1, DUCO_BULK_COMMAND_TIMEOUT_MS))
++	{
++		// SendCommandLocked has already reported how it failed; this keeps the
++		// throttled running count, which is what makes "every cycle" visible as
++		// distinct from "occasionally". PollCycle() doesn't gate on netwserial, but
++		// the cached-topology fallback and the node serials both depend on it.
++		LogFilteredValue("netwserial command failed", 1, 0);
++		return;
++	}
++
++	// Merge rather than replace. A reply that parses only some rows would otherwise
++	// drop every node it failed to mention, and since the serial map feeds the
++	// topology signature that alone is enough to make the signature flap and re-run
++	// the startup probe on the next cycle. A serial is immutable hardware identity, so
++	// keeping a previously-read one is always at least as correct as forgetting it.
++	const auto parsed = ParseNetwSerialRows(netwSerialRaw);
++	for (const auto& it : parsed)
++		m_nodeSerials[it.first] = it.second;
++}
++
++// Two letters followed by digits, e.g. RS1504011225 or PS1425000518. Anything else in
++// that column is a placeholder or a status word, not an identifier.
++bool CDucoBoxSerial::LooksLikeNodeSerial(const std::string& s)
++{
++	if (s.size() < 4 || !isalpha((unsigned char)s[0]) || !isalpha((unsigned char)s[1]))
++		return false;
++	for (size_t i = 2; i < s.size(); ++i)
++		if (!isdigit((unsigned char)s[i]))
++			return false;
++	return true;
++}
++
++std::map<int, std::string> CDucoBoxSerial::ParseNetwSerialRows(const std::string& raw) const
++{
++	std::map<int, std::string> serials;
++	if (raw.empty())
++		return serials;
++
++	std::string flat = raw;
++	std::replace(flat.begin(), flat.end(), '\r', ' ');
++	std::replace(flat.begin(), flat.end(), '\n', ' ');
++
++	const std::string low = ToLower(flat);
++	size_t start = low.find("start list");
++	size_t end = low.find("end list", (start == std::string::npos) ? 0 : start);
++	if (start != std::string::npos)
++		flat = flat.substr(start, (end != std::string::npos && end > start) ? (end - start) : std::string::npos);
++
++	std::vector<size_t> rowStarts;
++	const std::regex rowStartExpr("(^|\\s)([0-9]{1,4})\\s*\\|");
++	for (std::sregex_iterator it(flat.begin(), flat.end(), rowStartExpr), e; it != e; ++it)
++	{
++		const std::smatch& m = *it;
++		rowStarts.push_back((size_t)m.position(2));
++	}
++
++	for (size_t i = 0; i < rowStarts.size(); ++i)
++	{
++		size_t a = rowStarts[i];
++		size_t b = (i + 1 < rowStarts.size()) ? rowStarts[i + 1] : flat.size();
++		if (b <= a)
++			continue;
++
++		std::string row = Trim(flat.substr(a, b - a));
++		if (row.empty() || row.find('|') == std::string::npos)
++			continue;
++
++		std::vector<std::string> fields;
++		std::stringstream ss(row);
++		std::string item;
++		while (std::getline(ss, item, '|'))
++			fields.push_back(Trim(item));
++
++		if (fields.size() < 3)
++			continue;
++
++		int nodeId = 0;
++		try
++		{
++			nodeId = std::stoi(fields[0]);
++		}
++		catch (...)
++		{
++			continue;
++		}
++
++		// Validate the shape rather than blacklisting sentinels. A real Duco serial is
++		// two letters then digits (RS.../PS...); the column also carries "---" for a
++		// node that has none and "Failed" for one whose row is in an error state, and
++		// only the first of those was being rejected. "Failed" was consequently stored
++		// as two CLIMA nodes' serial, which put it in the topology signature and made
++		// that signature flap between cycles -- re-running the startup probe every
++		// cycle -- besides giving several nodes one shared value.
++		const std::string serial = fields[2];
++		if (LooksLikeNodeSerial(serial))
++			serials[nodeId] = serial;
++	}
++
++	return serials;
++}
++
++void CDucoBoxSerial::ProbeStartupSensors(const std::vector<NodeInfo>& nodes)
++{
++	m_sensorProbeCache.clear();
++	for (const auto& node : nodes)
++	{
++		// The measured outage happened during a first cycle, where this loop and the
++		// config read below are the bulk of the work. SendCommand() already fails fast
++		// once the bus is declared silent, so this only saves the inter-retry sleeps --
++		// but leaving a 20-node probe to grind through a dead bus reads as a hang.
++		if (m_silentAttemptStreak >= DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT)
++			return;
++		const SensorProbeResult probe = ProbeNodeSensors(node);
++		m_sensorProbeCache[node.nodeId] = probe;
++		PublishNodeSensors(node, probe);
++	}
++}
++
++bool CDucoBoxSerial::GetNodeTemperature(const NodeInfo& node, int& tempRawOut, const int retries)
++{
++	// The 'network' row (already fetched once per poll cycle for topology/flow)
++	// carries every sensor-equipped node's temperature for free; only fall back
++	// to a live nodeparaget(73) read when that row didn't report one.
++	if (node.hasTemp)
++	{
++		tempRawOut = node.tempRaw;
++		return true;
++	}
++	return ReadNodeParameter(node.nodeId, DUCO_TEMP_PARAGET, tempRawOut, retries);
++}
++
++CDucoBoxSerial::SensorProbeResult CDucoBoxSerial::ProbeNodeSensors(const NodeInfo& node)
++{
++	SensorProbeResult result;
++	const int nodeId = node.nodeId;
++
++	int tempRaw = 0;
++	if (GetNodeTemperature(node, tempRaw, 1))
++	{
++		const float tempC = tempRaw / 10.0F;
++		// Probe cache only records sane values; this prevents a bad first read from
++		// permanently classifying node capabilities incorrectly.
++		if (tempC > DUCO_MIN_TEMP_C && tempC < DUCO_MAX_TEMP_C)
++		{
++			result.hasTemp = true;
++			result.tempC = tempC;
++		}
++	}
++
++	int co2ppm = 0;
++	if (ReadNodeParameter(nodeId, DUCO_CO2_PARAGET, co2ppm, 1))
++	{
++		// Keep probe-derived CO2 capability strict to avoid exposing CO2 devices for
++		// nodes that only returned one-off junk values.
++		if (co2ppm >= DUCO_MIN_CO2_PPM && co2ppm <= DUCO_MAX_CO2_PPM)
++		{
++			result.hasCO2 = true;
++			result.co2ppm = co2ppm;
++		}
++	}
++
++	int rhRaw = 0;
++	if (ReadNodeParameter(nodeId, DUCO_RH_PARAGET, rhRaw, 1))
++	{
++		const int humidity = (int)std::lround(rhRaw / 100.0);
++		// RH probe keeps the same domain limits as runtime polling so startup and
++		// steady-state behavior do not diverge.
++		if (humidity >= DUCO_MIN_HUMIDITY && humidity <= DUCO_MAX_HUMIDITY)
++		{
++			result.hasRH = true;
++			result.humidity = humidity;
++		}
++	}
++
++	return result;
++}
++
++void CDucoBoxSerial::PublishNodeSensors(const NodeInfo& node, const SensorProbeResult& probe)
++{
++	const std::string displayName = NodeName(node);
++	const bool hasRHCapability = probe.hasRH || Contains(ToLower(node.type), "rh");
++
++	if (hasRHCapability)
++	{
++		if (probe.hasRH && probe.hasTemp && ShouldPublishTemperature(node.nodeId, probe.tempC))
++			SendTempHumSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::TempHum), 255, probe.tempC, probe.humidity, displayName + " TempHum");
++	}
++
++	if (probe.hasCO2)
++	{
++		// See the matching call in PublishNode() for why AirQuality/Voc (not a
++		// generic Custom Sensor) is the correct type for CO2 ppm, and why the
++		// stable key is split across NodeID+ChildID instead of truncated.
++		const uint16_t stableKey = StableKey16ForCapability(node.nodeId, SensorCapability::CO2);
++		SendAirQualitySensor(
++			static_cast<uint8_t>(stableKey >> 8),
++			static_cast<uint8_t>(stableKey & 0xFF),
++			255,
++			probe.co2ppm,
++			displayName + " CO2");
++	}
++
++	if (probe.hasTemp && !hasRHCapability && ShouldPublishTemperature(node.nodeId, probe.tempC))
++	{
++		SendTempSensor(StableNodeIdForCapability(node.nodeId, SensorCapability::Temperature), 255, probe.tempC, displayName + " Temperature");
++	}
++}
++
++bool CDucoBoxSerial::TryNormalizeTemperature(const int tempRaw, float& tempC, const char*& rejectReason) const
++{
++	tempC = tempRaw / 10.0F;
++	if (tempC <= DUCO_MIN_TEMP_C || tempC >= DUCO_MAX_TEMP_C)
++	{
++		rejectReason = "temperature out of plausible range";
++		return false;
++	}
++	return true;
++}
++
++void CDucoBoxSerial::LogFilteredValue(const std::string& reason, const int nodeId, const int rawValue)
++{
++	const std::string key = std::to_string(nodeId) + ":" + reason;
++	const int count = ++m_filterDropCounters[key];
++	if (count == 1 || (count % DUCO_FILTER_DROP_LOG_EVERY) == 0)
++		Log(LOG_NORM, "DucoBox: node %d %s (raw=%d), discarded %d time%s so far",
++			nodeId, reason.c_str(), rawValue, count, count == 1 ? "" : "s");
++}
++
++bool CDucoBoxSerial::MarkDeviceCreatedIfFirst(const int nodeId, const SensorCapability capability)
++{
++	const std::string key = std::to_string(nodeId) + ":" + std::to_string(static_cast<int>(capability));
++	return m_deviceEverCreated.insert(key).second;
++}
++
++bool CDucoBoxSerial::ShouldPublishTemperature(const int nodeId, const float tempC)
++{
++	const bool isZeroTemp = std::fabs(tempC) < 0.0001F;
++	auto it = m_seenNonZeroTemperature.find(nodeId);
++	const bool seenNonZeroBefore = (it != m_seenNonZeroTemperature.end() && it->second);
++
++	if (!isZeroTemp)
++	{
++		m_seenNonZeroTemperature[nodeId] = true;
++		return true;
++	}
++
++	if (seenNonZeroBefore)
++		return true;
++
++	// Many nodes briefly report 0.0 during boot/probe; suppress creating a device
++	// from that placeholder until we have seen at least one real temperature.
++	return false;
++}
++
++// Derived from the node id alone, deliberately: this must not depend on any
++// runtime state, because a device id that can change is a device that Domoticz
++// will silently recreate.
++//
++// This used to prefer FNV-1a of the node's serial, falling back to the node id
++// when the serial wasn't known. That made a sensor's identity depend on whether
++// m_nodeSerials happened to be populated at the moment of publishing, and
++// RefreshNodeSerials() replaces that map wholesale, so a single truncated
++// netwserial reply dropped nodes from it and flipped them to the fallback key.
++// Each flip created a second device and stranded the first. On the deployed
++// board one CO2 sensor ended up with three rows -- two distinct serial
++// hashes plus the node-id fallback -- with its history split across all
++// three.
++//
++// The serial map could also be cross-wired rather than merely incomplete: one
++// hash base keyed devices generated for two different nodes, so a garbled
++// netwserial had associated one node's serial with another node. Old ids
++// therefore cannot be reliably attributed after the fact, which is a second
++// reason not to key on them.
++//
++// The property given up is identity following the hardware across a re-address:
++// swap a valve and history now follows the node id (the position) rather than
++// the serial (the box). For sensors named after rooms that is the more useful
++// of the two, and it is worth far more than it costs to have identity be a pure
++// function of the node id.
++uint16_t CDucoBoxSerial::StableKey16ForCapability(const int nodeId, const SensorCapability capability) const
++{
++	const uint16_t base = (uint16_t)(nodeId & 0x0FFF);
++	const uint16_t cap = (uint16_t)(static_cast<uint8_t>(capability) & 0x000F);
++	return (uint16_t)((base << 4) | cap);
++}
++
++int CDucoBoxSerial::StableNodeIdForCapability(const int nodeId, const SensorCapability capability) const
++{
++	return (int)StableKey16ForCapability(nodeId, capability);
++}
++
++uint16_t CDucoBoxSerial::StableKey16(const int nodeId) const
++{
++	return (uint16_t)(nodeId & 0xFFFF);
++}
++
++int CDucoBoxSerial::StableNodeId(const int nodeId) const
++{
++	return (int)StableKey16(nodeId);
++}
++
++std::string CDucoBoxSerial::NodeName(const NodeInfo& node) const
++{
++	std::stringstream ss;
++	ss << "node " << node.nodeId << " " << node.type;
++	return ss.str();
++}
++
++// Parse `nodeconfigget <n>` rows such as:
++//   "   3. Capacity        : 100 m3/h   [20:5:200]"
++//   "   6. RH Delta        : OFF        [0:1:1]"
++std::vector<CDucoBoxSerial::ConfigParam> CDucoBoxSerial::ParseNodeConfigRows(const std::string& raw)
++{
++	std::vector<ConfigParam> out;
++	std::string text = raw;
++	std::replace(text.begin(), text.end(), '\r', '\n');
++
++	const std::regex rowRe(R"(^\s*(\d+)\.\s*(.+?)\s*:\s*(.+?)\s*$)");
++	const std::regex optRe(R"(\[(-?\d+):(-?\d+):(-?\d+)\])");
++	const std::regex intRe(R"(-?\d+)");
++
++	std::istringstream iss(text);
++	std::string line;
++	while (std::getline(iss, line))
++	{
++		std::smatch m;
++		if (!std::regex_match(line, m, rowRe))
++			continue;
++
++		ConfigParam p;
++		try
++		{
++			p.index = std::stoi(m[1].str());
++		}
++		catch (...)
++		{
++			continue;
++		}
++		p.name = Trim(m[2].str());
++		const std::string val = m[3].str();
++
++		std::smatch om;
++		if (std::regex_search(val, om, optRe))
++		{
++			p.vmin = std::stoi(om[1].str());
++			p.vstep = std::stoi(om[2].str());
++			p.vmax = std::stoi(om[3].str());
++		}
++		p.isBool = (p.vmin == 0 && p.vstep == 1 && p.vmax == 1);
++
++		// Value: prefer a numeric token (ignoring the range brackets), else ON/OFF.
++		const std::string valNoOpt = std::regex_replace(val, optRe, "");
++		std::smatch nm;
++		if (std::regex_search(valNoOpt, nm, intRe))
++			p.value = std::stoi(nm.str());
++		else
++			p.value = Contains(ToLower(valNoOpt), "on") ? 1 : 0;
++
++		if (Contains(val, "m3/h"))
++			p.unit = "m3/h";
++		else if (Contains(val, "ppm"))
++			p.unit = "ppm";
++		else if (Contains(val, "min"))
++			p.unit = "min";
++		else if (Contains(val, "%"))
++			p.unit = "%";
++		else
++			p.unit.clear();
++
++		out.push_back(p);
++	}
++	return out;
++}
++
++// Parse `ventctrlparaget` (box thresholds), e.g.
++//   "0. BALANCE THRESH. : 10 [%]  2. CTRL TEMP LOW : 160 [.1C] ..."
++std::vector<CDucoBoxSerial::ConfigParam> CDucoBoxSerial::ParseVentCtrlRows(const std::string& raw)
++{
++	std::vector<ConfigParam> out;
++	const std::regex re(R"((\d+)\.\s*([A-Za-z][A-Za-z0-9 .]+?)\s*:\s*(-?\d+))");
++	for (auto it = std::sregex_iterator(raw.begin(), raw.end(), re); it != std::sregex_iterator(); ++it)
++	{
++		const std::smatch& mm = *it;
++		ConfigParam p;
++		p.index = std::stoi(mm[1].str());
++		p.name = std::string("VentCtrl ") + Trim(mm[2].str());
++		const int v = std::stoi(mm[3].str());
++		if (p.index == 0) // balance threshold %
++		{
++			p.unit = "%"; p.value = v; p.vmin = 0; p.vstep = 5; p.vmax = 100;
++		}
++		else if (p.index == 1) // temp-dependent on/off
++		{
++			p.isBool = true; p.value = (v != 0) ? 1 : 0;
++		}
++		else // temp low/high, stored in 0.1 C
++		{
++			p.unit = "C"; p.value = v / 10; p.vmin = 0; p.vstep = 1; p.vmax = 40;
++		}
++		out.push_back(p);
++	}
++	return out;
++}
++
++void CDucoBoxSerial::PublishWritableConfig(const std::vector<NodeInfo>& nodes)
++{
++	for (const auto& node : nodes)
++	{
++		if (m_silentAttemptStreak >= DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT)
++			return;
++		PublishNodeConfig(node.nodeId);
++	}
++	PublishBoxVentCtrl();
++}
++
++void CDucoBoxSerial::PublishNodeConfig(const int nodeId)
++{
++	std::string raw;
++	if (!SendCommand("nodeconfigget " + std::to_string(nodeId), "done", raw))
++		return;
++	for (const auto& p : ParseNodeConfigRows(raw))
++	{
++		PublishConfigParam(nodeId, CfgNode, p);
++		// Cache the valve's rated capacity (m3/h) so PollCycle can derive the Flow
++		// device (capacity x airflow%) every cycle without re-reading config.
++		// PublishNodeConfig() can run on either Do_Work() or the Domoticz worker
++		// thread (via WriteToHardware), so this cache needs its own lock.
++		if (p.unit == "m3/h" && ToLower(p.name) == "capacity")
++		{
++			std::lock_guard<std::mutex> cacheLock(m_nodeConfigCacheMutex);
++			m_nodeCapacityM3h[nodeId] = p.value;
++		}
++	}
++}
++
++void CDucoBoxSerial::PublishBoxVentCtrl()
++{
++	std::string raw;
++	if (!SendCommand("ventctrlparaget", "done", raw))
++		return;
++	for (const auto& p : ParseVentCtrlRows(raw))
++		PublishConfigParam(1, CfgVentCtrl, p);
++}
++
++void CDucoBoxSerial::PublishConfigParam(const int nodeId, const ConfigGroup group, const ConfigParam& p)
++{
++	const std::string name = "node " + std::to_string(nodeId) + " " + p.name;
++
++	if (p.isBool)
++	{
++		const int32_t selId = (int32_t)(((uint32_t)DUCO_CFG_MARKER << 24) | ((uint32_t)group << 16)
++						| (((uint32_t)nodeId & 0xFF) << 8) | ((uint32_t)p.index & 0xFF));
++		const std::string level = p.value ? "10" : "0";
++		SendSelectorSwitch(selId, 1, level, name, 0, false, "Off|On", "", false, "");
++		return;
++	}
++
++	const uint8_t id1 = DUCO_CFG_MARKER;
++	const uint8_t id2 = (uint8_t)group;
++	const uint8_t id3 = (uint8_t)(nodeId & 0xFF);
++	const uint8_t id4 = (uint8_t)(p.index & 0xFF);
++	SendSetPointSensor(id1, id2, id3, id4, 1, 255, (float)p.value, name);
++
++	const std::string opts = "ValueMin:" + std::to_string(p.vmin) + ";ValueMax:" + std::to_string(p.vmax)
++				 + ";ValueStep:" + std::to_string(p.vstep) + ";ValueUnit:" + p.unit + ";";
++	SetConfigDeviceOptions(id1, id2, id3, id4, 1, pTypeSetpoint, sTypeSetpoint, opts);
++}
++
++void CDucoBoxSerial::SetConfigDeviceOptions(const uint8_t id1, const uint8_t id2, const uint8_t id3, const uint8_t id4,
++					    const uint8_t unit, const uint16_t devType, const uint16_t subType, const std::string& options)
++{
++	char szID[16];
++	sprintf(szID, "%X%02X%02X%02X", id1, id2, id3, id4);
++	auto result = m_sql.safe_query(
++		"SELECT ID FROM DeviceStatus WHERE (HardwareID==%d) AND (DeviceID=='%q') AND (Unit==%d) AND (Type==%d) AND (SubType==%d)",
++		m_HwdID, szID, unit, (int)devType, (int)subType);
++	if (result.empty())
++		return;
++	try
++	{
++		const uint64_t idx = std::stoull(result[0][0]);
++		m_sql.SetDeviceOptions(idx, m_sql.BuildDeviceOptions(options, false));
++	}
++	catch (...)
++	{
++	}
++}
++
++bool CDucoBoxSerial::WriteConfigValue(const ConfigGroup group, const int nodeId, const int index, const int value)
++{
++	std::string cmd;
++	if (group == CfgNode)
++		cmd = "NodeConfigSet " + std::to_string(nodeId) + " " + std::to_string(index) + " " + std::to_string(value);
++	else
++		cmd = "VentCtrlParaSet " + std::to_string(index) + " " + std::to_string(value);
++
++	Log(LOG_STATUS, "DucoBox: write %s", cmd.c_str());
++
++	std::string raw;
++	if (!SendCommand(cmd, "done", raw))
++	{
++		Log(LOG_ERROR, "DucoBox: write command got no confirmation: %s", cmd.c_str());
++		return false;
++	}
++	const std::string low = ToLower(raw);
++	if (Contains(low, "failed") || Contains(low, "unknown") || Contains(low, "incorrect"))
++	{
++		Log(LOG_ERROR, "DucoBox: device rejected write '%s' (%s)", cmd.c_str(), Trim(raw).c_str());
++		return false;
++	}
++
++	// Persist node writes and re-read so Domoticz reflects the value the box
++	// actually stored (it may clamp to the parameter's step/range).
++	if (group == CfgNode)
++	{
++		std::string saveRaw;
++		SendCommand("NodeSaveData " + std::to_string(nodeId), "done", saveRaw);
++		PublishNodeConfig(nodeId);
++	}
++	else
++	{
++		PublishBoxVentCtrl();
++	}
++	return true;
++}
++
++void CDucoBoxSerial::TrackAndMaybeRemediateStuckHumidity(const int nodeId, const int rhRaw, const bool flowPinnedHigh, const bool hasPairedUcRh, const int pairedUcRhRaw)
++{
++	const time_t now = mytime(nullptr);
++	auto& tracker = m_rhStuckTracker[nodeId];
++
++	if (!tracker.hasValue || rhRaw != tracker.lastRawValue)
++	{
++		tracker.hasValue = true;
++		tracker.lastRawValue = rhRaw;
++		tracker.sameSince = now;
++		return;
++	}
++
++	const time_t stuckDuration = now - tracker.sameSince;
++	const int humidity = (int)std::lround(rhRaw / 100.0);
++
++	// Two corroborating signals, confirmed together in a live capture on
++	// 2026-07-18: the valve pinned near-max airflow while its own reading hasn't
++	// budged (the observed failure signature), and/or its paired UC's own
++	// independent sensor reading a materially different value. Either shortens
++	// the flat-duration required to trigger well below the baseline 20 minutes.
++	const int ucRawDiff = (pairedUcRhRaw > rhRaw) ? (pairedUcRhRaw - rhRaw) : (rhRaw - pairedUcRhRaw);
++	const bool ucDisagrees = hasPairedUcRh && ucRawDiff >= (DUCO_RH_STUCK_UC_DISAGREEMENT_PCT * 100);
++
++	time_t requiredDuration = DUCO_RH_STUCK_MIN_DURATION_SECONDS;
++	if (flowPinnedHigh)
++		requiredDuration = std::min(requiredDuration, DUCO_RH_STUCK_MIN_DURATION_SECONDS_FAST);
++	if (ucDisagrees)
++		requiredDuration = std::min(requiredDuration, DUCO_RH_STUCK_MIN_DURATION_SECONDS_UC_CONFIRM);
++
++	if (stuckDuration < requiredDuration)
++		return;
++
++	if (m_pendingOverruleRemediation.find(nodeId) != m_pendingOverruleRemediation.end())
++		return; // already mid-remediation
++
++	const auto cooldownIt = m_lastStuckRemediation.find(nodeId);
++	if (cooldownIt != m_lastStuckRemediation.end() && (now - cooldownIt->second) < DUCO_RH_STUCK_COOLDOWN_SECONDS)
++		return;
++
++	if (rhRaw == 0)
++	{
++		// Whitelisted: a bit-exact-frozen raw=0 means the sensor itself is
++		// floating/disconnected (e.g. node 22 -- confirmed permanently
++		// broken/floating, not a genuine stuck-latch), not a valve that
++		// needs forcing to unstick a real reading. The DUCO_MIN_HUMIDITY
++		// check above already keeps 0% from being published; forcing an
++		// overrule here only moves the valve for no benefit, and was
++		// observed leaving node 22 away from its expected position.
++		return;
++	}
++
++	Log(LOG_ERROR, "DucoBox: node %d RH reading stuck at exactly %d%% (raw %d) for %ld min (flowPinnedHigh=%d, ucDisagrees=%d) -- forcing manual override to clear it",
++		nodeId, humidity, rhRaw, (long)(stuckDuration / 60), (int)flowPinnedHigh, (int)ucDisagrees);
++
++	m_lastStuckRemediation[nodeId] = now;
++
++	if (IssueNodeOverrule(nodeId, DUCO_RH_STUCK_OVERRULE_HIGH_PCT))
++	{
++		m_pendingOverruleRemediation[nodeId] = { OverruleRemediationPhase::DriveLow, now + DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS };
++		Log(LOG_STATUS, "DucoBox: node %d overruled to %d%% for %ld s (step 1/3) to clear stuck RH reading",
++			nodeId, DUCO_RH_STUCK_OVERRULE_HIGH_PCT, (long)DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS);
++	}
++	else
++	{
++		Log(LOG_ERROR, "DucoBox: node %d overrule for stuck-RH remediation failed", nodeId);
++	}
++
++	// Reset so a still-stuck sensor after release is timed from a fresh window
++	// rather than immediately re-triggering next poll (the cooldown above already
++	// blocks re-trigger, but this keeps the tracked duration meaningful if logged).
++	tracker.sameSince = now;
++}
++
++void CDucoBoxSerial::TrackAndMaybeRemediateStuckTemperature(const int nodeId, const int tempRaw)
++{
++	const time_t now = mytime(nullptr);
++	auto& tracker = m_tempStuckTracker[nodeId];
++
++	if (!tracker.hasValue || tempRaw != tracker.lastRawValue)
++	{
++		tracker.hasValue = true;
++		tracker.lastRawValue = tempRaw;
++		tracker.sameSince = now;
++		return;
++	}
++
++	const time_t stuckDuration = now - tracker.sameSince;
++	if (stuckDuration < DUCO_TEMP_STUCK_MIN_DURATION_SECONDS)
++		return;
++
++	const float tempC = tempRaw / 10.0F;
++	// A genuinely stable indoor temperature staying bit-exact for 20+ minutes
++	// is completely ordinary -- only a latched value that's ALSO outside the
++	// plausible range already enforced where this is published is treated as
++	// a fault.
++	if (tempC > DUCO_MIN_TEMP_C && tempC < DUCO_MAX_TEMP_C)
++		return;
++
++	// Shares pending-remediation/cooldown state with the RH remediation: this
++	// is fundamentally the same node-level "kick" (force manual, hold, hold,
++	// release), so if the humidity check already has one in flight for this
++	// node, don't fire a second, redundant overrule on top of it.
++	if (m_pendingOverruleRemediation.find(nodeId) != m_pendingOverruleRemediation.end())
++		return;
++
++	const auto cooldownIt = m_lastStuckRemediation.find(nodeId);
++	if (cooldownIt != m_lastStuckRemediation.end() && (now - cooldownIt->second) < DUCO_RH_STUCK_COOLDOWN_SECONDS)
++		return;
++
++	Log(LOG_ERROR, "DucoBox: node %d temperature reading stuck at exactly %.1fC (raw %d) for %ld min -- forcing manual override to clear it",
++		nodeId, tempC, tempRaw, (long)(stuckDuration / 60));
++
++	m_lastStuckRemediation[nodeId] = now;
++
++	if (IssueNodeOverrule(nodeId, DUCO_RH_STUCK_OVERRULE_HIGH_PCT))
++	{
++		m_pendingOverruleRemediation[nodeId] = { OverruleRemediationPhase::DriveLow, now + DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS };
++		Log(LOG_STATUS, "DucoBox: node %d overruled to %d%% for %ld s (step 1/3) to clear stuck temperature reading",
++			nodeId, DUCO_RH_STUCK_OVERRULE_HIGH_PCT, (long)DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS);
++	}
++	else
++	{
++		Log(LOG_ERROR, "DucoBox: node %d overrule for stuck-temperature remediation failed", nodeId);
++	}
++
++	tracker.sameSince = now;
++}
++
++bool CDucoBoxSerial::IssueNodeOverrule(const int nodeId, const int value)
++{
++	const std::string cmd = "NodeSetOverrule " + std::to_string(nodeId) + " " + std::to_string(value);
++	Log(LOG_STATUS, "DucoBox: %s", cmd.c_str());
++
++	std::string raw;
++	if (!SendCommand(cmd, "done", raw))
++	{
++		Log(LOG_ERROR, "DucoBox: overrule command got no confirmation: %s", cmd.c_str());
++		return false;
++	}
++	const std::string low = ToLower(raw);
++	if (Contains(low, "failed") || Contains(low, "unknown") || Contains(low, "incorrect"))
++	{
++		Log(LOG_ERROR, "DucoBox: device rejected overrule '%s' (%s)", cmd.c_str(), Trim(raw).c_str());
++		return false;
++	}
++	return true;
++}
++
++void CDucoBoxSerial::CheckPendingOverruleRemediation()
++{
++	if (m_pendingOverruleRemediation.empty())
++		return;
++
++	const time_t now = mytime(nullptr);
++	for (auto it = m_pendingOverruleRemediation.begin(); it != m_pendingOverruleRemediation.end();)
++	{
++		if (now < it->second.deadline)
++		{
++			++it;
++			continue;
++		}
++
++		const int nodeId = it->first;
++		if (it->second.phase == OverruleRemediationPhase::DriveLow)
++		{
++			if (IssueNodeOverrule(nodeId, DUCO_RH_STUCK_OVERRULE_LOW_PCT))
++			{
++				Log(LOG_STATUS, "DucoBox: node %d overruled to %d%% for %ld s (step 2/3) to clear stuck RH reading",
++					nodeId, DUCO_RH_STUCK_OVERRULE_LOW_PCT, (long)DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS);
++				it->second.phase = OverruleRemediationPhase::DriveSettle;
++				it->second.deadline = now + DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS;
++				++it;
++			}
++			else
++			{
++				// Keep the entry and retry next cycle rather than abandoning the node
++				// pinned at 100% -- a failed step (e.g. a serial hiccup) must not be
++				// the last word.
++				Log(LOG_ERROR, "DucoBox: node %d overrule to %d%% failed mid stuck-RH remediation, will retry", nodeId, DUCO_RH_STUCK_OVERRULE_LOW_PCT);
++				++it;
++			}
++		}
++		else if (it->second.phase == OverruleRemediationPhase::DriveSettle)
++		{
++			if (IssueNodeOverrule(nodeId, DUCO_RH_STUCK_OVERRULE_SETTLE_PCT))
++			{
++				Log(LOG_STATUS, "DucoBox: node %d overruled to %d%% for %ld s (step 3/3) to clear stuck RH reading",
++					nodeId, DUCO_RH_STUCK_OVERRULE_SETTLE_PCT, (long)DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS);
++				it->second.phase = OverruleRemediationPhase::Release;
++				it->second.deadline = now + DUCO_RH_STUCK_OVERRULE_HOLD_SECONDS;
++				++it;
++			}
++			else
++			{
++				// Same reasoning as the DriveLow retry above -- don't abandon the node
++				// pinned at 0% on a transient failure.
++				Log(LOG_ERROR, "DucoBox: node %d overrule to %d%% failed mid stuck-RH remediation, will retry", nodeId, DUCO_RH_STUCK_OVERRULE_SETTLE_PCT);
++				++it;
++			}
++		}
++		else // Release
++		{
++			if (IssueNodeOverrule(nodeId, DUCO_OVERRULE_RELEASE))
++			{
++				Log(LOG_STATUS, "DucoBox: node %d released back to Auto after stuck-RH remediation", nodeId);
++				it = m_pendingOverruleRemediation.erase(it);
++			}
++			else
++			{
++				// Same reasoning as above -- retry rather than leave the node pinned
++				// at 0% indefinitely.
++				Log(LOG_ERROR, "DucoBox: node %d release-to-Auto failed after stuck-RH remediation, will retry", nodeId);
++				++it;
++			}
++		}
++	}
++}
++
++// Duco echoes the command it received before answering it, prefixed with its
++// prompt ("> nodeparaget 10 74"). Everything ahead of that echo belongs to an
++// earlier command whose reply was still arriving. Answering the current command
++// from those bytes is how a humidity reading ends up published as CO2 (raw RH
++// centi-percent, 4980, reads as a plausible-looking 4980 ppm) and how a write
++// that the box confirmed with "Done" gets reported as rejected, because the
++// leftover 'network' table carries the word "Failed" in a node's status column.
++// Anchor on the echo so only the box's answer to *this* command is ever read.
++std::string CDucoBoxSerial::AfterCommandEcho(const std::string& raw, const std::string& command)
++{
++	const std::string lowRaw = ToLower(raw);
++	const std::string lowCmd = ToLower(command);
++	if (lowCmd.empty())
++		return std::string();
++
++	// Prefer a prompt-prefixed occurrence: the command word can legitimately appear
++	// inside a reply's own text, and anchoring on that would truncate the answer.
++	size_t best = std::string::npos;
++	size_t fallback = std::string::npos;
++	for (size_t pos = lowRaw.find(lowCmd); pos != std::string::npos; pos = lowRaw.find(lowCmd, pos + 1))
++	{
++		fallback = pos;
++		size_t back = pos;
++		while (back > 0 && (lowRaw[back - 1] == ' ' || lowRaw[back - 1] == '\t'))
++			--back;
++		if (back > 0 && lowRaw[back - 1] == '>')
++			best = pos;
++	}
++	// Last, not first: a retry resends the same command, so the buffer can hold this
++	// command's own earlier echo from the attempt that timed out.
++	const size_t anchor = (best != std::string::npos) ? best : fallback;
++	if (anchor == std::string::npos)
++		return std::string();
++	return raw.substr(anchor + lowCmd.size());
++}
++
++bool CDucoBoxSerial::SendCommand(const std::string& command, const std::string& expectToken, std::string& outRaw, int retries, int timeoutMs)
++{
++	std::lock_guard<std::mutex> serialLock(m_commandMutex);
++
++	const bool isNetwork = (ToLower(Trim(command)) == "network");
++	if (timeoutMs <= 0)
++		timeoutMs = DUCO_COMMAND_TIMEOUT_MS;
++
++	// Bus already declared silent: fail immediately rather than spending a quiet
++	// window and a full budget finding out again. Covers every caller at once,
++	// including the startup probe, the config read and UI writes, which is where the
++	// measured outage did most of its damage. Cleared by OpenSerialDevice().
++	if (m_silentAttemptStreak >= DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT)
++		return false;
++
++	// Refreshed here rather than only in Do_Work's idle loop: a poll cycle runs
++	// well past the 60s hardware-thread heartbeat check in mainworker, and pausing
++	// before every command stretches it further. Without this the plugin gets
++	// reported as a hung thread on every cycle -- a false alarm that trains the
++	// reader to ignore a message that matters.
++	m_LastHeartbeat = mytime(nullptr);
++	sleep_milliseconds(isNetwork ? DUCO_NETWORK_QUIET_MS : DUCO_INTER_COMMAND_PAUSE_MS);
++
++	const bool ok = SendCommandLocked(command, expectToken, outRaw, retries, timeoutMs);
++
++	if (isNetwork)
++	{
++		// Let the tail of the node table finish arriving while we still hold the
++		// mutex, so it cannot bleed into whatever command runs next.
++		m_LastHeartbeat = mytime(nullptr);
++		sleep_milliseconds(DUCO_NETWORK_QUIET_MS);
++	}
++	return ok;
++}
++
++bool CDucoBoxSerial::SendCommandLocked(const std::string& command, const std::string& expectToken, std::string& outRaw, int retries, int timeoutMs)
++{
++	bool sawEcho = false;
++	// Diagnostics: enough state to say *how* a command failed, not just that it did.
++	// The three cases are indistinguishable from the outside and want different fixes:
++	// no echo at all means the command never got through; an echo with no completion
++	// marker means the reply was cut off by the budget; a marker without the expected
++	// token means the box answered something else entirely.
++	bool everSawMarker = false;
++	bool everSawExpect = false;
++	size_t mostBytes = 0;
++	long lastElapsedMs = 0;
++	const auto callStart = std::chrono::steady_clock::now();
++	int attemptsUsed = 0;
++	for (int attempt = 0; attempt < retries; ++attempt)
++	{
++		++attemptsUsed;
++		// Drop stale async bytes before sending a command so completion detection is
++		// based on fresh data only.
++		ClearRxBuffer();
++		write(command + "\r");
++
++		std::string best;
++		auto start = std::chrono::steady_clock::now();
++		auto lastData = start;
++		size_t lastSize = 0;
++		bool done = false;
++
++		while (true)
++		{
++			const std::string snap = GetRxSnapshot();
++			if (snap.size() != lastSize)
++			{
++				best = snap;
++				lastSize = snap.size();
++				lastData = std::chrono::steady_clock::now();
++			}
++
++			// Match markers against the box's answer to this command only. Judging the
++			// whole buffer let a stale reply satisfy completion before our own answer
++			// had even arrived -- "-->" contains ">", so leftover bytes plus 250ms of
++			// quiet counted as a finished command carrying someone else's value.
++			const std::string reply = AfterCommandEcho(best, command);
++			const bool haveEcho = !reply.empty();
++			if (haveEcho)
++				sawEcho = true;
++			const std::string low = ToLower(reply);
++			// Completion markers are intentionally broad: Duco output can be concatenated
++			// or interleaved with unsolicited list/status output.
++			const bool hasMarker = Contains(low, "--- end list ---") || Contains(low, "done") || Contains(low, "failed") || Contains(low, "unknown cmd") || Contains(low, "unknown command") || Contains(low, "incorrect cmd arguments") || Contains(reply, ">") || Contains(reply, "-->");
++			const bool hasExpect = expectToken.empty() || Contains(low, ToLower(expectToken));
++			auto now = std::chrono::steady_clock::now();
++			const auto idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastData).count();
++			const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
++
++			if (hasMarker)
++				everSawMarker = true;
++			if (hasExpect && !expectToken.empty())
++				everSawExpect = true;
++			if (best.size() > mostBytes)
++				mostBytes = best.size();
++			lastElapsedMs = (long)totalMs;
++
++			if (haveEcho && hasMarker && idleMs >= DUCO_COMMAND_IDLE_MS && (hasExpect || Contains(reply, "-->")))
++			{
++				done = true;
++				break;
++			}
++			if (totalMs >= timeoutMs)
++				break;
++
++			sleep_milliseconds(20);
++		}
++
++		// A read window that closed having received nothing is the signature of a bus
++		// that has stopped talking, as opposed to one answering slowly or garbling it.
++		// Any byte at all clears the streak: partial or corrupt replies are what the
++		// retries and the network-fail streak already exist for.
++		if (best.empty())
++			++m_silentAttemptStreak;
++		else
++			m_silentAttemptStreak = 0;
++
++		// Hand callers the echo-anchored reply, so every parser downstream (parameter
++		// values, write confirmations, the node table) sees only this command's answer.
++		// Firmware that doesn't echo at all never sets sawEcho and keeps the old
++		// whole-buffer behaviour rather than losing its replies entirely.
++		if (!best.empty())
++			outRaw = sawEcho ? AfterCommandEcho(best, command) : best;
++
++		if (done)
++		{
++			if (m_consecutiveSilentTrips > 0)
++			{
++				Log(LOG_STATUS, "DucoBox: bus answering again after %d silent reconnect(s)", m_consecutiveSilentTrips);
++				m_consecutiveSilentTrips = 0;
++			}
++			// Knowing the margin is what keeps the budget from being a guess: if a
++			// command routinely answers in half its allowance, the allowance is about
++			// to stop being enough.
++			if (lastElapsedMs > timeoutMs / DUCO_SLOW_COMMAND_LOG_FRACTION)
++				Log(LOG_STATUS, "DucoBox: '%s' answered in %ldms of a %dms budget (%zu bytes, attempt %d)",
++				    command.c_str(), lastElapsedMs, timeoutMs, mostBytes, attemptsUsed);
++			return true;
++		}
++
++		// Resending into silence cannot help, for the same reason resending a reply
++		// that is merely slow cannot: nothing is listening.
++		if (m_silentAttemptStreak >= DUCO_SILENT_ATTEMPTS_BEFORE_RECONNECT)
++			break;
++
++		sleep_milliseconds(DUCO_COMMAND_RETRY_DELAY_MS);
++	}
++
++	const long totalCallMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
++					 std::chrono::steady_clock::now() - callStart).count();
++	Log(LOG_ERROR, "DucoBox: '%s' unanswered: %d attempt(s), %ldms total, %dms budget each, %zu bytes seen, echo %s, completion marker %s, expected token '%s' %s",
++	    command.c_str(), attemptsUsed, totalCallMs, timeoutMs, mostBytes,
++	    sawEcho ? "seen" : "MISSING",
++	    everSawMarker ? "seen" : "MISSING",
++	    expectToken.c_str(),
++	    expectToken.empty() ? "n/a" : (everSawExpect ? "seen" : "MISSING"));
++
++	// All retries exhausted without ever seeing a completion marker: report this
++	// as a real failure rather than success-if-any-bytes-arrived. A garbled
++	// partial reply (e.g. async log frames interleaved right as a command was
++	// sent) previously came back as "success", which could silently wipe
++	// probe/config state downstream (callers still see whatever landed in
++	// outRaw, they just no longer get told it's trustworthy).
++	return false;
++}
++
++bool CDucoBoxSerial::ReadNodeParameter(const int nodeId, const int paraId, int& valueOut, int retries)
++{
++	for (int attempt = 0; attempt < retries; ++attempt)
++	{
++		std::stringstream ss;
++		ss << "nodeparaget " << nodeId << " " << paraId;
++		std::string raw;
++		if (SendCommand(ss.str(), "", raw, 1) && ParseNodeParaValue(raw, valueOut))
++			return true;
++
++		sleep_milliseconds(DUCO_COMMAND_RETRY_DELAY_MS);
++	}
++	return false;
++}
++
++void CDucoBoxSerial::ClearRxBuffer()
++{
++	std::lock_guard<std::mutex> lock(m_rxMutex);
++	m_rxBuffer.clear();
++}
++
++std::string CDucoBoxSerial::GetRxSnapshot()
++{
++	std::lock_guard<std::mutex> lock(m_rxMutex);
++	return m_rxBuffer;
++}
++
++std::string CDucoBoxSerial::ToLower(const std::string& s)
++{
++	std::string out = s;
++	std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return (char)std::tolower(c); });
++	return out;
++}
++
++std::string CDucoBoxSerial::Trim(const std::string& s)
++{
++	size_t start = 0;
++	while (start < s.size() && std::isspace((unsigned char)s[start]))
++		start++;
++
++	size_t end = s.size();
++	while (end > start && std::isspace((unsigned char)s[end - 1]))
++		end--;
++
++	return s.substr(start, end - start);
++}
++
++bool CDucoBoxSerial::Contains(const std::string& haystack, const std::string& needle)
++{
++	return haystack.find(needle) != std::string::npos;
++}
++
++bool CDucoBoxSerial::ParseNodeParaValue(const std::string& raw, int& valueOut)
++{
++	const std::string low = ToLower(raw);
++	// Never infer values from random numbers in garbled text; require explicit marker.
++	if ((Contains(low, "unknown cmd") || Contains(low, "unknown command") || Contains(low, "incorrect cmd arguments") || Contains(low, "failed")) && !Contains(raw, "-->"))
++		return false;
++
++	std::smatch match;
++	const std::regex marker("-->\\s*(-?[0-9]+)");
++	if (std::regex_search(raw, match, marker) && match.size() > 1)
++	{
++		try
++		{
++			valueOut = std::stoi(match[1].str());
++			return true;
++		}
++		catch (...)
++		{
++			return false;
++		}
++	}
++	return false;
++}
++
++bool CDucoBoxSerial::ParseFanRpm(const std::string& raw, int& rpmOut)
++{
++	std::smatch match;
++	const std::regex actualExpr("Actual\\s+([0-9]+)", std::regex::icase);
++	if (std::regex_search(raw, match, actualExpr) && match.size() > 1)
++	{
++		try
++		{
++			rpmOut = std::stoi(match[1].str());
++			return true;
++		}
++		catch (...) {}
++	}
++
++	const std::regex rpmExpr("([0-9]{2,5})\\s*\\[?rpm\\]?", std::regex::icase);
++	if (std::regex_search(raw, match, rpmExpr) && match.size() > 1)
++	{
++		try
++		{
++			rpmOut = std::stoi(match[1].str());
++			return true;
++		}
++		catch (...) {}
++	}
++
++	return false;
++}
++
++int CDucoBoxSerial::StatToSelectorLevel(const std::string& stat)
++{
++	const std::string s = ToLower(stat);
++	if (s == "auto")
++		return 0;
++	if (s == "man1")
++		return 10;
++	if (s == "man2")
++		return 20;
++	if (s == "man3")
++		return 30;
++	return -1;
++}
++
++bool CDucoBoxSerial::ParseFanPower(const std::string& raw, int& wattsOut)
++{
++	std::smatch match;
++	// Mirror ducoparse.parse_fanperform: instantaneous power is "Power Now : N W".
++	const std::regex powerExpr("Power\\s+Now\\s*:\\s*(-?[0-9]+)", std::regex::icase);
++	if (std::regex_search(raw, match, powerExpr) && match.size() > 1)
++	{
++		try
++		{
++			wattsOut = std::stoi(match[1].str());
++			return true;
++		}
++		catch (...) {}
++	}
++
++	return false;
++}
++
++std::vector<CDucoBoxSerial::NodeInfo> CDucoBoxSerial::ParseNetworkRows(const std::string& raw)
++{
++	std::vector<NodeInfo> nodes;
++	if (raw.empty())
++		return nodes;
++
++	std::string normalized = raw;
++	std::replace(normalized.begin(), normalized.end(), '\r', '\n');
++
++	// Keep legacy defaults for known layouts, then override from parsed headers
++	// when present to tolerate column reorderings across firmware variants.
++	int nodeCol = 0;
++	int typeCol = 2;
++	int assoCol = 6;
++	int statCol = 8;
++	int cntdwnCol = 9;
++	int flowCol = 10;
++	int ovrlCol = 14;
++	int tempCol = 18;
++	int infoCol = 19;
++	bool inList = false;
++
++	std::stringstream stream(normalized);
++	std::string line;
++	while (std::getline(stream, line))
++	{
++		line = Trim(line);
++		if (line.empty())
++			continue;
++
++		const std::string lineLower = ToLower(line);
++		if (!inList)
++		{
++			if (Contains(lineLower, "start list"))
++				inList = true;
++			continue;
++		}
++
++		if (Contains(lineLower, "end list"))
++			break;
++
++		if (line.find('|') == std::string::npos || line.find("---") != std::string::npos)
++			continue;
++
++		std::vector<std::string> fields;
++		std::stringstream rowStream(line);
++		std::string item;
++		while (std::getline(rowStream, item, '|'))
++			fields.push_back(Trim(item));
++
++		if (fields.size() < 2)
++			continue;
++
++		int nodeId = 0;
++		bool hasNodeId = false;
++		try
++		{
++			nodeId = std::stoi(fields[nodeCol]);
++			hasNodeId = true;
++		}
++		catch (...) {}
++
++		if (!hasNodeId)
++		{
++			for (size_t idx = 0; idx < fields.size(); ++idx)
++			{
++				const std::string col = ToLower(fields[idx]);
++				if (col == "node" || col == "nodeid")
++					nodeCol = (int)idx;
++				else if (col == "type")
++					typeCol = (int)idx;
++				else if (col == "info")
++					infoCol = (int)idx;
++				else if (col == "temp")
++					tempCol = (int)idx;
++				else if (col == "stat")
++					statCol = (int)idx;
++				else if (col == "cntdwn")
++					cntdwnCol = (int)idx;
++				else if (col == "ovrl")
++					ovrlCol = (int)idx;
++				else if (col == "asso")
++					assoCol = (int)idx;
++				else if (Contains(col, "debiet") || Contains(col, "flow") || Contains(col, "airflow"))
++					flowCol = (int)idx;
++			}
++			continue;
++		}
++
++		if (typeCol < 0 || (size_t)typeCol >= fields.size())
++			continue;
++
++		NodeInfo n;
++		n.nodeId = nodeId;
++		n.type = fields[typeCol];
++		n.info = ((size_t)infoCol < fields.size()) ? fields[infoCol] : "";
++
++		if ((size_t)flowCol < fields.size())
++		{
++			std::smatch flowMatch;
++			if (std::regex_search(fields[flowCol], flowMatch, std::regex("^\\s*(-?[0-9]+)")) && flowMatch.size() > 1)
++			{
++				try
++				{
++					n.flowPercent = std::stoi(flowMatch[1].str());
++					n.hasFlowPercent = true;
++				}
++				catch (...)
++				{
++					n.hasFlowPercent = false;
++				}
++			}
++		}
++
++		if ((size_t)assoCol < fields.size())
++		{
++			std::smatch assoMatch;
++			if (std::regex_search(fields[assoCol], assoMatch, std::regex("^\\s*(-?[0-9]+)")) && assoMatch.size() > 1)
++			{
++				try
++				{
++					n.assoNodeId = std::stoi(assoMatch[1].str());
++					n.hasAsso = true;
++				}
++				catch (...)
++				{
++				}
++			}
++		}
++
++		if ((size_t)tempCol < fields.size())
++		{
++			// A bare '-' (no sensor at all, e.g. SWITCH nodes) simply won't match
++			// this numeric pattern, leaving hasTemp false.
++			std::smatch tempMatch;
++			if (std::regex_search(fields[tempCol], tempMatch, std::regex("^\\s*(-?[0-9]+)")) && tempMatch.size() > 1)
++			{
++				try
++				{
++					const int raw = std::stoi(tempMatch[1].str());
++					// Plain valves with no sensor board consistently report exactly 0
++					// here; treat that the same as "no reading" rather than 0.0C.
++					if (raw != 0)
++					{
++						n.tempRaw = raw;
++						n.hasTemp = true;
++					}
++				}
++				catch (...)
++				{
++				}
++			}
++		}
++
++		if ((size_t)statCol < fields.size())
++		{
++			const std::string& s = fields[statCol];
++			// Node types without runtime override state (UC/SWITCH) report '-' here.
++			if (!s.empty() && s != "-")
++			{
++				n.overrideState = s;
++				n.hasOverrideState = true;
++			}
++		}
++
++		if ((size_t)cntdwnCol < fields.size())
++		{
++			std::smatch cntdwnMatch;
++			if (std::regex_search(fields[cntdwnCol], cntdwnMatch, std::regex("^\\s*(-?[0-9]+)")) && cntdwnMatch.size() > 1)
++			{
++				try
++				{
++					n.cntdwnRaw = std::stoi(cntdwnMatch[1].str());
++					n.hasCntdwn = true;
++				}
++				catch (...)
++				{
++				}
++			}
++		}
++
++		if ((size_t)ovrlCol < fields.size())
++		{
++			std::smatch ovrlMatch;
++			if (std::regex_search(fields[ovrlCol], ovrlMatch, std::regex("^\\s*(-?[0-9]+)")) && ovrlMatch.size() > 1)
++			{
++				try
++				{
++					n.ovrlRaw = std::stoi(ovrlMatch[1].str());
++					n.hasOvrl = true;
++				}
++				catch (...)
++				{
++				}
++			}
++		}
++
++		nodes.push_back(n);
++	}
++
++	return nodes;
++}
+diff --git a/hardware/DucoBoxSerial.h b/hardware/DucoBoxSerial.h
+new file mode 100644
+index 000000000..c3a3b25e0
+--- /dev/null
++++ b/hardware/DucoBoxSerial.h
+@@ -0,0 +1,311 @@
++#pragma once
++
++#include "ASyncSerial.h"
++#include "DomoticzHardware.h"
++
++#include <atomic>
++#include <functional>
++#include <ctime>
++#include <mutex>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++class CDucoBoxSerial : public AsyncSerial, public CDomoticzHardwareBase
++{
++public:
++	CDucoBoxSerial(int ID, const std::string& devname);
++	~CDucoBoxSerial() override = default;
++
++	bool WriteToHardware(const char* pdata, unsigned char length) override;
++
++private:
++	struct NodeInfo
++	{
++		int nodeId = 0;
++		std::string type;
++		std::string info;
++		bool hasFlowPercent = false;
++		int flowPercent = 0;
++		// The 'network' row's own 'temp' column (deci-C) already carries every
++		// sensor-equipped node's temperature for free -- GetNodeTemperature()
++		// prefers this over a separate nodeparaget(73) read. A literal 0 here is
++		// indistinguishable from "no sensor" (plain valves report exactly 0), so
++		// it is treated the same as the column being absent.
++		bool hasTemp = false;
++		int tempRaw = 0;
++		// The network row's own 'stat'/'cntdwn'/'ovrl' columns (valves/CLIMA/box
++		// only -- other node types report '-' here, which parses to these staying
++		// false/unset). Already present in the same 'network' read as everything
++		// else above, so no extra command is needed to publish them.
++		bool hasOverrideState = false;
++		std::string overrideState; // "AUTO"/"MAN1"/"MAN2"/"MAN3"/...
++		bool hasCntdwn = false;
++		int cntdwnRaw = 0; // seconds, ~1/sec countdown observed live
++		bool hasOvrl = false;
++		int ovrlRaw = 0; // 255 == no explicit override active
++		// The network row's 'asso' (association) column: for a UC node with its
++		// own RH/CO2 sensor, this is the valve node it's paired with -- used to
++		// cross-check a valve's RH reading against its UC's independent sensor.
++		bool hasAsso = false;
++		int assoNodeId = 0;
++	};
++
++	struct SensorProbeResult
++	{
++		bool hasTemp = false;
++		bool hasCO2 = false;
++		bool hasRH = false;
++		float tempC = 0.0F;
++		int co2ppm = 0;
++		int humidity = 0;
++	};
++
++	enum class SensorCapability : uint8_t
++	{
++		SwitchState = 1,
++		TempHum = 2,
++		Temperature = 3,
++		CO2 = 4,
++		FanSpeed = 5,
++		AirflowPercent = 6,
++		SerialText = 7,
++		Power = 8,
++		Flow = 9,
++		Mode = 10,
++		Countdown = 11,
++		OverrideActive = 12
++	};
++
++	// One writable configuration parameter as reported by `nodeconfigget` (or the
++	// box `ventctrlparaget`). index/vmin/vstep/vmax come straight from the CLI so
++	// the published Domoticz control gets the correct range without hard-coding.
++	struct ConfigParam
++	{
++		int index = 0;
++		std::string name;
++		int value = 0;
++		int vmin = 0;
++		int vstep = 1;
++		int vmax = 100;
++		std::string unit;   // "%", "m3/h", "ppm", "min", "C" or "" (raw)
++		bool isBool = false; // range 0:1:1 -> publish as a selector (Off/On)
++	};
++
++	// Group selects the write command family; encoded into the device id so
++	// WriteToHardware can route a UI change back to the right serial command.
++	enum ConfigGroup : uint8_t { CfgNode = 0, CfgVentCtrl = 1 };
++
++	bool StartHardware() override;
++	bool StopHardware() override;
++	bool OpenSerialDevice();
++	void Do_Work();
++	void readCallback(const char* data, size_t len);
++
++	void PollCycle();
++	// True when the bus has gone silent and the caller should abandon the cycle: logs
++	// the trip and closes the port so Do_Work()'s existing reconnect path takes over.
++	bool AbortCycleIfBusSilent();
++	// Runs a command that has several possible spellings, remembering which one the
++	// firmware answers to so later cycles ask once instead of probing the whole list.
++	// parse returns true when the reply was understood. cache/parseFailures hold the
++	// learned name and its consecutive-unparseable count.
++	bool RunCachedVariant(const std::vector<std::string>& variants, std::string& cache,
++			      int& parseFailures, std::string& rawOut,
++			      const std::function<bool(const std::string&)>& parseAndPublish);
++	void ProbeStartupSensors(const std::vector<NodeInfo>& nodes);
++	SensorProbeResult ProbeNodeSensors(const NodeInfo& node);
++	void PublishNodeSensors(const NodeInfo& node, const SensorProbeResult& probe);
++	// Prefers the network row's own temperature (see NodeInfo::hasTemp) over a
++	// live nodeparaget(73) read; only falls back to the serial read when the
++	// row didn't carry one. retries is forwarded to that fallback read.
++	bool GetNodeTemperature(const NodeInfo& node, int& tempRawOut, int retries = 3);
++
++	// Writable configuration (setpoints / thresholds / capacity / fan levels).
++	void PublishWritableConfig(const std::vector<NodeInfo>& nodes);
++	void PublishNodeConfig(int nodeId);
++	void PublishBoxVentCtrl();
++
++	// Hardware workaround: some RH sensors occasionally latch onto a reading
++	// (observed: exactly unchanged across many consecutive polls) which then drives
++	// the fan to max fighting a phantom humidity level. A physical UC button press
++	// (forcing manual mode, then letting it time out back to Auto) is known to clear
++	// it; these replicate that over the serial protocol. See docs/duco-api-reference.md.
++	// Confirmed live 2026-07-18 via direct serial capture across an actual button
++	// press: raw RH bit-exact flat with the valve pinned at 100% airflow, then both
++	// the airflow and the raw reading moved again immediately after the overrule.
++	void CheckPendingOverruleRemediation();
++	// flowPinnedHigh: this valve's own airflow%% is currently pinned near max (the
++	// observed failure signature); hasPairedUcRh/pairedUcRhRaw: this valve's
++	// associated UC's own independent RH reading, when one exists. Either
++	// corroborating signal shortens the flat-duration required to trigger --
++	// see the constants and comment where they're used.
++	void TrackAndMaybeRemediateStuckHumidity(int nodeId, int rhRaw, bool flowPinnedHigh, bool hasPairedUcRh, int pairedUcRhRaw);
++	// tempRaw: this node's temperature in tenths of a degree, from the same
++	// network-row read GetNodeTemperature() resolves -- see the constant's
++	// own comment for why this needs a plausibility check that the RH path
++	// doesn't.
++	void TrackAndMaybeRemediateStuckTemperature(int nodeId, int tempRaw);
++	bool IssueNodeOverrule(int nodeId, int value);
++	void PublishConfigParam(int nodeId, ConfigGroup group, const ConfigParam& p);
++	bool WriteConfigValue(ConfigGroup group, int nodeId, int index, int value);
++	void SetConfigDeviceOptions(uint8_t id1, uint8_t id2, uint8_t id3, uint8_t id4,
++				    uint8_t unit, uint16_t devType, uint16_t subType, const std::string& options);
++	static std::vector<ConfigParam> ParseNodeConfigRows(const std::string& raw);
++	static std::vector<ConfigParam> ParseVentCtrlRows(const std::string& raw);
++	void RefreshNodeSerials();
++	std::map<int, std::string> ParseNetwSerialRows(const std::string& raw) const;
++	static bool LooksLikeNodeSerial(const std::string& s);
++	bool TryNormalizeTemperature(int tempRaw, float& tempC, const char*& rejectReason) const;
++	void LogFilteredValue(const std::string& reason, int nodeId, int rawValue);
++	bool MarkDeviceCreatedIfFirst(int nodeId, SensorCapability capability);
++	bool ShouldPublishTemperature(int nodeId, float tempC);
++	// const on purpose: a device id must be a pure function of the node id and
++	// capability, never of runtime state -- see the comment on the definition.
++	uint16_t StableKey16ForCapability(int nodeId, SensorCapability capability) const;
++	int StableNodeIdForCapability(int nodeId, SensorCapability capability) const;
++	uint16_t StableKey16(int nodeId) const;
++	int StableNodeId(int nodeId) const;
++	std::string NodeName(const NodeInfo& node) const;
++
++	// timeoutMs <= 0 means the normal per-command budget; the bulk table reads pass a
++	// much longer one (see DUCO_BULK_COMMAND_TIMEOUT_MS).
++	bool SendCommand(const std::string& command, const std::string& expectToken, std::string& outRaw, int retries = 3, int timeoutMs = 0);
++	bool SendCommandLocked(const std::string& command, const std::string& expectToken, std::string& outRaw, int retries, int timeoutMs);
++	bool ReadNodeParameter(int nodeId, int paraId, int& valueOut, int retries = 3);
++
++	void ClearRxBuffer();
++	std::string GetRxSnapshot();
++
++	static std::string ToLower(const std::string& s);
++	static std::string Trim(const std::string& s);
++	static bool Contains(const std::string& haystack, const std::string& needle);
++	static std::string AfterCommandEcho(const std::string& raw, const std::string& command);
++	static bool ParseNodeParaValue(const std::string& raw, int& valueOut);
++	static bool ParseFanRpm(const std::string& raw, int& rpmOut);
++	static bool ParseFanPower(const std::string& raw, int& wattsOut);
++	// Maps the network row's 'stat' column to a Domoticz Selector Switch level
++	// (0/10/20/30 = Auto/Manual 1/2/3); -1 for anything not in that known set.
++	static int StatToSelectorLevel(const std::string& stat);
++	static std::vector<NodeInfo> ParseNetworkRows(const std::string& raw);
++
++	std::string m_szSerialPort;
++	unsigned int m_iBaudRate = 115200;
++	int m_retrycntr = 0;
++
++	std::string m_rxBuffer;
++	mutable std::mutex m_rxMutex;
++	// Serialises whole command send+read cycles: WriteToHardware() runs on the
++	// Domoticz worker thread while PollCycle() runs on Do_Work(), and both drive
++	// the single serial port.
++	std::mutex m_commandMutex;
++	std::shared_ptr<std::thread> m_thread;
++	bool m_startupProbeDone = false;
++	// Writable config (thresholds/capacities/setpoints) barely ever changes, so unlike
++	// the sensor-capability probe above it is re-read on its own weekly cadence rather
++	// than every topology check; see DUCO_CONFIG_REFRESH_SECONDS.
++	bool m_configProbeDone = false;
++	// Set when the writable config needs (re-)reading -- first run, or a topology
++	// change bringing a node whose config we have never read. Consumed a cycle later
++	// than the startup probe so the two don't land in the same cycle; see PollCycle.
++	bool m_configReadPending = true;
++	int m_configDeferrals = 0;
++	time_t m_lastConfigReadTime = 0;
++	std::map<int, SensorProbeResult> m_sensorProbeCache;
++	// Protects m_nodeCapacityM3h: PublishNodeConfig() writes it from either
++	// Do_Work() (PollCycle) or the Domoticz worker thread (via WriteToHardware ->
++	// WriteConfigValue), while PollCycle() reads it from Do_Work() -- unlike the
++	// serial port itself (m_commandMutex), plain std::map access here isn't
++	// otherwise synchronised.
++	mutable std::mutex m_nodeConfigCacheMutex;
++	// Cached per-node Capacity (m3/h, nodeconfig index 3 on valves) so the Flow device
++	// can be computed every poll cycle without re-reading config each time.
++	std::map<int, int> m_nodeCapacityM3h;
++	std::map<int, std::string> m_nodeSerials;
++	std::map<int, bool> m_seenNonZeroTemperature;
++	std::map<int, std::string> m_lastPublishedNodeSerialText;
++	std::map<std::string, int> m_filterDropCounters;
++	std::set<std::string> m_deviceEverCreated; // "<nodeId>:<capability>" once a device has been sent at least once
++	std::string m_lastTopologySignature;
++	int m_networkFailStreak = 0;
++	// Consecutive command attempts whose read window closed having received nothing
++	// at all. Distinct from m_networkFailStreak, which counts whole failed cycles of
++	// one command and cannot tell a garbled reply from a dead bus. Atomic because
++	// WriteToHardware() drives commands from Domoticz's worker thread while Do_Work()
++	// checkpoints this between steps of a poll cycle.
++	std::atomic<int> m_silentAttemptStreak{ 0 };
++	// Consecutive reconnects caused by silence; drives the reconnect backoff and
++	// throttles the trip log. Do_Work thread only.
++	int m_consecutiveSilentTrips = 0;
++	// Which spelling of the fan-speed and fan-performance commands this firmware
++	// actually answers to, learned on first success. Empty until then. Do_Work thread
++	// only. Not persisted: the answering name is a property of the firmware, so
++	// relearning it once per process start costs a few seconds and cannot go stale.
++	std::string m_fanSpeedCmd;
++	std::string m_fanPerformCmd;
++	int m_fanSpeedParseFailures = 0;
++	int m_fanPerformParseFailures = 0;
++	// When the port was last opened, so a silence trip can report how long after the
++	// open the bus went quiet -- the evidence needed to decide whether opening the
++	// port is itself implicated, rather than guessing at a settling delay.
++	time_t m_portOpenedAt = 0;
++	// Fallback topology cache: when the bulk 'network' command itself fails, but the
++	// separate, lighter-weight 'netwserial' read (see RefreshNodeSerials) still
++	// confirms the exact same set of node serials as when we last had a good
++	// 'network' parse, it's safe to assume nothing physically changed and keep
++	// polling individual nodes using this cached list rather than going completely
++	// dark for the whole cycle. Structural per-node fields sourced only from the
++	// network row itself (flow%, override state) go stale in this fallback path;
++	// RH/CO2/temp still come from fresh per-node nodeparaget reads either way.
++	std::vector<NodeInfo> m_lastKnownNodes;
++	std::map<int, std::string> m_lastKnownNodesSerialSnapshot;
++
++	// Stuck-sensor tracking (see docs/duco-api-reference.md): a hardware fault
++	// occasionally latches a node's raw reading -- observed on both the RH
++	// (centi-percent HUM_SENSOR_VAL) and temperature (tenths-of-a-degree) raw
++	// values, which come off the same per-node read. A latched RH reading
++	// drives the fan hard trying to satisfy a phantom humidity level; a latched
++	// temperature reading is otherwise harmless but is the more reliable tell,
++	// since real readings -- even during a plateaued real shower, or a
++	// perfectly stable room -- still show a few raw units of jitter poll to
++	// poll. Only bit-exact equality over a sustained window is treated as a
++	// fault (validated against 6 months of history: naive rounded-percent and
++	// fan-near-max heuristics both fire constantly on ordinary shower use).
++	// One tracker type, one instance per raw value tracked (m_rhStuckTracker,
++	// m_tempStuckTracker) -- the two faults are independent and can overlap.
++	struct StuckValueTracker
++	{
++		// Explicit "no reading yet" flag rather than a sentinel raw value: -1 is a
++		// valid (if implausible) raw reading, so a sensor that happens to latch at
++		// exactly -1 would otherwise instant-trigger remediation on the very first
++		// poll after startup (stuckDuration computed from a zero-initialized
++		// sameSince).
++		bool hasValue = false;
++		int lastRawValue = 0;
++		time_t sameSince = 0;
++	};
++	std::map<int, StuckValueTracker> m_rhStuckTracker;
++	std::map<int, StuckValueTracker> m_tempStuckTracker;
++
++	// Remediation drives the valve through its full range -- 100%, then 0%, then
++	// 10%, a minute each -- rather than to one extreme and back to Auto: confirmed
++	// by hand that picking mode 1 on the node's own UC panel reliably clears a
++	// stuck reading, and unlike a single overrule step, that also cycles the valve
++	// fully closed. DriveLow is "currently holding 100%, due to switch to 0%";
++	// DriveSettle is "currently holding 0%, due to switch to 10%"; Release is
++	// "currently holding 10%, due to switch back to Auto".
++	enum class OverruleRemediationPhase
++	{
++		DriveLow,
++		DriveSettle,
++		Release,
++	};
++	struct PendingOverruleRemediation
++	{
++		OverruleRemediationPhase phase;
++		time_t deadline;
++	};
++	std::map<int, PendingOverruleRemediation> m_pendingOverruleRemediation;
++	std::map<int, time_t> m_lastStuckRemediation;
++};
+diff --git a/main/RFXNames.cpp b/main/RFXNames.cpp
+index 108424035..af9c7d5fc 100755
+--- a/main/RFXNames.cpp
++++ b/main/RFXNames.cpp
+@@ -281,6 +281,7 @@ static const STR_TABLE_SINGLE HardwareTypeTable[] = {
+ 	{ HTYPE_DaikinModbus, "Daikin Altherma (Modbus TCP via Homehub)", "DaikinHH" },
+ 	{ HTYPE_OpenMeteo, "Open-Meteo (Weather Lookup)", "OpenMeteo" },
+ 	{ HTYPE_Matter, "Matter (python-matterjs-server)", "Matter" },
++	{ HTYPE_DucoBoxSerial, "DucoBox Serial USB", "DucoBox" },
+ 	{ 0, nullptr, nullptr },
+ };
+ 
+@@ -4001,6 +4002,7 @@ bool IsSerialDevice(const _eHardwareTypes htype)
+ 	case HTYPE_Comm5Serial:
+ 	case HTYPE_USBtinGateway:
+ 	case HTYPE_DenkoviUSBDevices:
++	case HTYPE_DucoBoxSerial:
+ 		return true;
+ 	default:
+ 		return false;
+diff --git a/main/RFXNames.h b/main/RFXNames.h
+index 976b580da..03a4d8e5a 100644
+--- a/main/RFXNames.h
++++ b/main/RFXNames.h
+@@ -225,6 +225,7 @@ enum _eHardwareTypes {
+ 	HTYPE_VisualCrossing,		//127
+ 	HTYPE_MitsubishiWF,			//128
+ 	HTYPE_Matter,				//129
++	HTYPE_DucoBoxSerial,		//130
+ 	HTYPE_END
+ };
+ 
+diff --git a/main/mainworker.cpp b/main/mainworker.cpp
+index ed5a3c293..500b76ab9 100644
+--- a/main/mainworker.cpp
++++ b/main/mainworker.cpp
+@@ -121,6 +121,7 @@
+ #include "../hardware/DenkoviDevices.h"
+ #include "../hardware/DenkoviUSBDevices.h"
+ #include "../hardware/DenkoviTCPDevices.h"
++#include "../hardware/DucoBoxSerial.h"
+ #include "../hardware/AccuWeather.h"
+ #include "../hardware/BleBox.h"
+ #include "../hardware/Ec3kMeterTCP.h"
+@@ -1089,6 +1090,9 @@ bool MainWorker::AddHardwareFromParams(
+ 	case HTYPE_OpenMeteo:
+ 		pHardware = new COpenMeteo(ID);
+ 		break;
++	case HTYPE_DucoBoxSerial:
++		pHardware = new CDucoBoxSerial(ID, SerialPort);
++		break;
+ 	case HTYPE_AirconWithMe:
+ 		pHardware = new CAirconWithMe(ID, Address, Port, Username, Password);
+ 		break;
+-- 
+2.51.0
+

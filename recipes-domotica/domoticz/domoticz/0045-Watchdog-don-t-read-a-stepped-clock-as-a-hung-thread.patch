@@ -1,0 +1,84 @@
+From 9116bffa55ac5409b26f158959d1aa2078ce95eb Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sun, 26 Jul 2026 08:48:03 +0200
+Subject: [PATCH 45/50] Watchdog: don't read a stepped clock as a hung thread
+
+A system without a battery-backed RTC boots with its wall clock at the
+image build date, and NTP then corrects it in a single step. On an
+affected board that step was 134 days wide, and heartbeat
+ages are wall-clock differences, so the correction makes every thread
+look hung at the same instant and kills a perfectly healthy process
+seconds after boot. Observed live:
+
+  chronyd:  System clock was stepped by 11629158.868549 seconds
+  domoticz: Error: mainworker seems to have ended or hung unexpectedly
+            (last update 11629168.000000 seconds ago)
+  domoticz: Error: Domoticz(829) is exiting due to watchdog triggered...
+  systemd:  Main process exited, code=killed, status=10/USR1
+
+one second apart, the second figure being the step plus the nine seconds
+of real time between them.
+
+Measure the same interval against a monotonic clock as well. When the
+two disagree by more than a slew could account for, the clock moved
+rather than time passing, so carry the heartbeats across the step and
+leave the threads alone. The per-hardware and component heartbeat checks
+in mainworker.cpp compare wall-clock times the same way, but those only
+log, so they mislead rather than kill.
+
+Upstream-Status: Pending
+---
+ main/SignalHandler.cpp | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/main/SignalHandler.cpp b/main/SignalHandler.cpp
+index 130cf0774..1c90d1026 100644
+--- a/main/SignalHandler.cpp
++++ b/main/SignalHandler.cpp
+@@ -24,8 +24,14 @@
+ #endif
+ 
+ #include "SignalHandler.h"
++#include <chrono>
+ 
+ #define Heartbeat_Timeout 300 //5 minutes
++//Heartbeat ages below are wall-clock differences, so a stepped clock is
++//indistinguishable from a hung thread. Anything beyond this much disagreement
++//between the wall clock and a monotonic reference is the clock moving, not time
++//passing. Generous enough to ignore NTP slewing, far below any real timeout.
++#define Heartbeat_Clock_Step_Tolerance 10 //seconds
+ 
+ extern MainWorker m_mainworker;
+ 
+@@ -497,6 +503,28 @@ static void heartbeat_check()
+ 	time_t now;
+ 	mytime(&now);
+ 
++	// A system without a battery-backed RTC boots with its wall clock at the image
++	// build date, and NTP then corrects it in a single step that can be months
++	// wide. Every heartbeat age below is a wall-clock difference, so that step
++	// makes all threads look hung at once and kills a perfectly healthy process
++	// seconds after boot. Measure the same interval monotonically: when the two
++	// disagree the clock moved, so carry the heartbeats across the step instead of
++	// reading it as a timeout.
++	static auto lastSteady = std::chrono::steady_clock::now();
++	static time_t lastWall = now;
++	const auto nowSteady = std::chrono::steady_clock::now();
++	const double steadyElapsed = std::chrono::duration_cast<std::chrono::seconds>(nowSteady - lastSteady).count();
++	const double clockStep = difftime(now, lastWall) - steadyElapsed;
++	lastSteady = nowSteady;
++	lastWall = now;
++	if (std::abs(clockStep) > Heartbeat_Clock_Step_Tolerance)
++	{
++		_log.Log(LOG_STATUS, "Watchdog: system clock stepped by %.0f seconds, carrying heartbeats across the step", clockStep);
++		m_mainworker.m_LastHeartbeat += (time_t)clockStep;
++		m_LastHeartbeat += (time_t)clockStep;
++		return;
++	}
++
+ 	double diff = difftime(now, m_mainworker.m_LastHeartbeat);
+ 	if (diff > Heartbeat_Timeout)
+ 	{
+-- 
+2.51.0
+

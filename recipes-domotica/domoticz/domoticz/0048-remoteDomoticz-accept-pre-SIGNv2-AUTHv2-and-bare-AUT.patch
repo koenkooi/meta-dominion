@@ -1,0 +1,133 @@
+From e4021c4a0565ffa85d64c382f25864d876b8fe6e Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Wed, 29 Jul 2026 14:56:36 +0200
+Subject: [PATCH 48/50] remoteDomoticz: accept pre-SIGNv2 (AUTHv2 and bare
+ AUTH) clients as unframed legacy
+
+Domoticz's remote/shared-instance protocol has moved twice since 2021:
+AUTHv2 was renamed to SIGNv2 in 2024, then SIGNv3 added a 4-byte
+length-prefixed frame around every message in April 2026. A server
+running that newer framing has no way to tell an incoming pre-SIGNv2
+connection apart from a malformed frame - its first bytes get read as
+a bogus ~1GB frame length and the connection is dropped with "Invalid
+frame length (1096111176)".
+
+The existing SIGNv* legacy check only recognizes the 2024-era keyword
+and deliberately rejects it with a "please update" log line - a
+reasonable choice for a two-year-old client. Two older keywords
+predate that rename entirely and weren't covered by it at all:
+"AUTHv2", and, in even older releases, plain "AUTH" with no version
+suffix. Confirmed live against the actual client that surfaced this:
+domoticz-gateway, still running 2020.2 (build 12833, from 2021-01-08),
+sends "AUTH;user;passwordhash" - no "v2". A raw packet capture on the
+wire was needed to find this; the auth keyword isn't logged anywhere
+until authentication has already succeeded, so guessing from version
+numbers alone (as the first version of this fix did) isn't reliable -
+the client's own binary was the authoritative source in the end
+(`strings domoticz | grep AUTH` shows the exact format string,
+"AUTH;%s;%s").
+
+Add narrow support for both keywords: authenticate them the same way
+as a framed client, then keep that one connection in unframed mode
+(one message per read, no length prefix) for its lifetime, matching
+how these clients have always sent data. This is an interim
+compatibility shim for instances that haven't been upgraded in years,
+not a protocol reimplementation - it doesn't touch the SIGNv2 path.
+
+A real SIGNv3 frame can never legitimately start with the 4 bytes
+"AUTH" either: read as a big-endian length they decode to ~1.09
+billion, already well past the 1 MB overflow-guard ceiling, so
+widening the match from the literal "AUTHv" to just "AUTH" carries no
+new collision risk with the framed protocol.
+
+Assisted-by: claude:claude-sonnet-5 [Read] [Edit] [Bash]
+
+Upstream-Status: Inappropriate [WIP]
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ tcpserver/TCPClient.cpp | 52 +++++++++++++++++++++++++++++++++++++++++
+ tcpserver/TCPClient.h   |  4 ++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/tcpserver/TCPClient.cpp b/tcpserver/TCPClient.cpp
+index 4a3429f22..4670e6458 100644
+--- a/tcpserver/TCPClient.cpp
++++ b/tcpserver/TCPClient.cpp
+@@ -44,6 +44,58 @@ namespace tcp {
+ 			{
+ 				m_recvBuffer.append(buffer_.data(), bytes_transferred);
+ 
++				// Legacy compat: pre-SIGNv2 Domoticz sends its auth line and every device-
++				// update message unframed - one write() per message, no length prefix.
++				// Two keywords predate the SIGNv2 rename: "AUTHv2" and, in even older
++				// releases, plain "AUTH" with no version at all (confirmed live: Domoticz
++				// 2020.2 build 12833's own binary contains the literal format string
++				// "AUTH;%s;%s", no "v2" - domoticz-gateway is one of these). Both split
++				// into the same 3-field "<keyword>;user;passwordhash" shape, so one check
++				// on the common 4-byte "AUTH" prefix covers both; a real SIGNv3 frame can
++				// never legitimately start with those same 4 bytes either, since read as a
++				// big-endian length they decode to ~1.09 billion, already well past the
++				// overflow guard's 1 MB ceiling. Once a connection is identified as one of
++				// these, every subsequent read is handled here instead of the length-
++				// prefixed parser below, which would otherwise misread the auth line as a
++				// huge bogus frame length. Deliberately narrower than the SIGNv* check just
++				// below (these exact keywords only), so it revives interop with instances
++				// old enough to predate the SIGNv2 rename entirely without relaxing the
++				// SIGNv2 reject-and-log behavior upstream chose for the more recent legacy
++				// case.
++				if (m_bLegacyUnframed)
++				{
++					if (!m_recvBuffer.empty())
++					{
++						pConnectionManager->DoDecodeMessage(this, (const uint8_t*)m_recvBuffer.data(), m_recvBuffer.size());
++						m_recvBuffer.clear();
++					}
++					socket_->async_read_some(boost::asio::buffer(buffer_), [self](auto&& err, auto bytes) { self->handleRead(err, bytes); });
++					return;
++				}
++
++				if (!m_bIsLoggedIn && m_recvBuffer.size() >= 4 && m_recvBuffer.substr(0, 4) == "AUTH")
++				{
++					std::vector<std::string> strarray;
++					StringSplit(m_recvBuffer, ";", strarray);
++					if (strarray.size() == 3)
++					{
++						m_recvBuffer.clear();
++						if (!pConnectionManager->HandleAuthentication(self, strarray[1], strarray[2]))
++						{
++							boost::asio::async_write(*socket_, boost::asio::buffer("NOAUTH", 6), [self](auto&& err, auto) { self->handleWrite(err); });
++							pConnectionManager->stopClient(self);
++							return;
++						}
++						m_bIsLoggedIn = true;
++						m_bLegacyUnframed = true;
++						m_username = strarray[1];
++						_log.Log(LOG_STATUS, "Authentication succeeded for user %s on %s (%s, unframed legacy protocol - update this remote when possible)",
++							m_username.c_str(), m_endpoint.c_str(), strarray[0].c_str());
++					}
++					socket_->async_read_some(boost::asio::buffer(buffer_), [self](auto&& err, auto bytes) { self->handleRead(err, bytes); });
++					return;
++				}
++
+ 				// Detect old unframed SIGNv* clients before framing checks — their data
+ 				// is not length-prefixed and would be misread as a frame header.
+ 				if (!m_bIsLoggedIn && m_recvBuffer.size() >= 6 && m_recvBuffer.substr(0, 5) == "SIGNv")
+diff --git a/tcpserver/TCPClient.h b/tcpserver/TCPClient.h
+index 2f319a0d6..2e4b62553 100644
+--- a/tcpserver/TCPClient.h
++++ b/tcpserver/TCPClient.h
+@@ -23,6 +23,10 @@ public:
+ 	std::string m_username;
+ 	std::string m_endpoint;
+ 	bool m_bIsLoggedIn = false;
++	// Set once a pre-SIGNv2 ("AUTHv2") client authenticates: that protocol sends every
++	// message unframed, one write() per message, so this connection skips the length-
++	// prefix parser for its whole remaining lifetime. See handleRead() in TCPClient.cpp.
++	bool m_bLegacyUnframed = false;
+ 
+ 	// usual tcp parameters
+ 	boost::asio::ip::tcp::socket *socket() { return socket_; }
+-- 
+2.51.0
+

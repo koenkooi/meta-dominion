@@ -1,0 +1,555 @@
+From ffb304e2612a9fe6f5d72d5dab1916505a32fbfe Mon Sep 17 00:00:00 2001
+From: Koen Kooi <koen@dominion.thruhere.net>
+Date: Sun, 2 Aug 2026 10:42:54 +0200
+Subject: [PATCH 50/50] OnkyoAVTCP: fix core bugs and add network standby,
+ mute, tone and misc devices
+
+First round of fixes (bugs found reading the plugin against a real
+TX-NR575E, cross-checked against independent eISCP implementations
+and a live upstream bug report, domoticz/domoticz#5640):
+
+- Zone 3 and Zone 4 selectors used the wrong eISCP command codes
+  (SL2/SL3 instead of SL3/SL4). Every other eISCP implementation
+  checked (node-eiscp, miracle2k/onkyo-eiscp) agrees on SL3=zone3,
+  SL4=zone4.
+- The zone/input parsing loop only covered zones 1-3, so Zone 4 never
+  received an input list.
+- Volume ignored the receiver's actual volmax/volstep, sending/
+  reading raw Domoticz 0-100 levels as if they were native device
+  units. Now scales both directions using the live volmax parsed from
+  the NRI capability XML, with a divide-by-zero guard for zones with
+  no volume control at all (this receiver's Zone2).
+- Demoted per-packet send/receive traces from LOG_ERROR/LOG_NORM to
+  Debug(DEBUG_HARDWARE, ...) -- a receiver that's on and playing
+  pushes an NTM update once a second, which was flooding the log.
+- sprintf -> snprintf for consistency.
+
+Second round -- the remaining items from the plan's Phase 1/2, plus
+new devices from Phase 3 (the ones with an unambiguous, live-probed
+wire format; see below for what was deliberately left out and why):
+
+- Fixed the selector "Off" placeholder colliding with real input code
+  0x00 (both use the same LevelActions hex-parse path, so any 2-char
+  input id could shadow the synthetic Off entry). The placeholder is
+  now "100", a value that can never be produced by parsing a real
+  2-hex-digit (0x00-0xFF) input code. Existing devices created before
+  this fix are migrated in place the next time their zone data is
+  processed.
+- Guarded the dynamic selector-growth path against exceeding 26
+  entries (the most _tGeneralSwitch::level, a uint8_t stepped by 10,
+  can represent) -- logs and refuses instead of silently wrapping.
+- Added a dedicated per-zone mute switch (On = muted), independent of
+  the existing dimmer-on/off mute toggle, which is kept as-is for
+  backward compatibility. This also means a zone with volmax=0
+  (line-level, no volume control -- e.g. this receiver's Zone2) no
+  longer loses its mute control, since it's no longer tied to a
+  volume device that might not exist.
+- Network standby (NSB) as an On/Off switch -- this is the setting
+  that decides whether the receiver stays reachable at all while
+  powered off; previously invisible.
+- Front-panel dimmer (DIM), sleep timer (SLP) and three simple
+  toggles (Music Optimizer/MOT, Late Night/LTN, Cinema Filter-Re-EQ/
+  RAS) as selectors/switches.
+- Bass and treble (TFR) as setpoint devices (-10..+10), matching the
+  existing DucoBoxSerial.cpp precedent for setpoint-style controls.
+  TFR carries both values in one packet in both directions, so a
+  write to either setpoint is combined with the other's last-known
+  value before sending.
+- Audio/video format info (IFA/IFV) as text sensors, alongside the
+  existing metadata sensors.
+
+Deliberately not implemented, to avoid shipping guessed protocol
+behaviour against a real device:
+- Listening mode (LMD): controllist advertises Movie/Music/Game as
+  "cycle within category" plus Stereo as an absolute code, but the
+  exact wire encoding for "start of category" isn't confirmed by any
+  source found, live-documented or otherwise.
+- Center/subwoofer level (CTL/SWL): live-confirmed at zero ("000")
+  but the signed encoding for nonzero values isn't confirmed the way
+  TFR's sign+hex-digit format is.
+- Net services (NSV), tuner presets (PRS/TUN), transport state (NST):
+  research found these consistently low-value/rarely built across
+  other eISCP integrations, and this receiver's presets are all
+  empty.
+
+Also evaluated whether this plugin's hand-rolled device management
+(EnsureSwitchDevice's raw SQL INSERT/SELECT, ReceiveSwitchMsg's own
+dedup-and-update logic) still matches current idiom, since the file
+predates helpers like SendGeneralSwitch/SendSelectorSwitch that now
+do the same job centrally. It's not deprecated -- SendGeneralSwitch
+itself is a thin wrapper over the same underlying sDecodeRXMessage
+call -- but it is a legacy pattern that a newer plugin (DucoBoxSerial)
+in this fork doesn't use. New devices in this commit stay on the
+existing table-driven mechanism rather than mixing two device-
+management styles in one file; a full migration of the pre-existing
+devices to the modern helpers is a separate, larger, and riskier
+change than this patch, and is not attempted here.
+
+Upstream-Status: Inappropriate [WIP]
+
+Signed-off-by: Koen Kooi <koen@dominion.thruhere.net>
+---
+ hardware/OnkyoAVTCP.cpp | 246 +++++++++++++++++++++++++++++++++++-----
+ hardware/OnkyoAVTCP.h   |  10 ++
+ 2 files changed, 230 insertions(+), 26 deletions(-)
+
+diff --git a/hardware/OnkyoAVTCP.cpp b/hardware/OnkyoAVTCP.cpp
+index 322bb2f8d..a6c8a63c7 100644
+--- a/hardware/OnkyoAVTCP.cpp
++++ b/hardware/OnkyoAVTCP.cpp
+@@ -10,6 +10,8 @@
+ #include "../tinyxpath/tinyxml.h"
+ #include "../main/WebServer.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <sstream>
+ 
+ #define RETRY_DELAY 30
+@@ -44,6 +46,24 @@ namespace
+ 		ID_SL3,
+ 		ID_SL4,
+ 		ID_HDO,
++		ID_NSB,
++		ID_MUTE_MAIN,
++		ID_MUTE_Z2,
++		ID_MUTE_Z3,
++		ID_MUTE_Z4,
++		ID_DIM,
++		ID_SLP,
++		ID_MOT,
++		ID_LTN,
++		ID_RAS,
++	};
++
++	// Setpoint (tone control) device numbers, disjoint from DevNr above -- these use
++	// pTypeSetpoint, not pTypeGeneralSwitch, so they are never looked up in switch_types.
++	enum SetpointNr
++	{
++		SP_BASS = 0,
++		SP_TREBLE,
+ 	};
+ 
+ 	struct selector_name
+@@ -102,9 +122,20 @@ namespace
+ 		int customImage;
+ 		const char *options;
+ 		const struct selector_name *default_names;
++		// Wire values for On/Off writes. Almost everything on this protocol uses hex "01"/"00"
++		// (matching the historical default below); NSB is the one exception, using the literal
++		// text tokens "ON"/"OFF" instead.
++		const char *onValue = "01";
++		const char *offValue = "00";
+ 	};
+ 
+-	constexpr std::array<_switch_types, 13> switch_types{
++	// "Off"/"Off" collided with real input 0x00 (STB/DVR) under hex parsing -- strtoul() of any
++	// non-hex string also yields 0, same as a genuine "00" input code (see §3.4 / item 6). "100"
++	// parses to 256, which can never collide with a real 2-hex-digit (0x00-0xFF) input/selector
++	// value, so it is safe to use as the synthetic "nothing selected yet" placeholder.
++	constexpr const char *SELECTOR_OFF_SENTINEL = "100";
++
++	constexpr std::array<_switch_types, 23> switch_types{
+ 		{
+ 			{ "MVL", "AMT", "Master volume", STYPE_Dimmer, sSwitchGeneralSwitch, 8, nullptr, nullptr },										    //
+ 			{ "ZVL", "ZMT", "Zone 2 volume", STYPE_Dimmer, sSwitchGeneralSwitch, 8, nullptr, nullptr },										    //
+@@ -114,25 +145,81 @@ namespace
+ 			{ "ZPW", nullptr, "Zone 2 power", STYPE_OnOff, sSwitchGeneralSwitch, 5, nullptr, nullptr },										    //
+ 			{ "PW3", nullptr, "Zone 3 power", STYPE_OnOff, sSwitchGeneralSwitch, 5, nullptr, nullptr },										    //
+ 			{ "PW4", nullptr, "Zone 4 power", STYPE_OnOff, sSwitchGeneralSwitch, 5, nullptr, nullptr },										    //
+-			{ "SLI", nullptr, "Master selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:00", input_names },	    //
+-			{ "SLZ", nullptr, "Zone 2 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:00", input_names },	    //
+-			{ "SL2", nullptr, "Zone 3 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:00", input_names },	    //
+-			{ "SL3", nullptr, "Zone 4 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:00", input_names },	    //
++			{ "SLI", nullptr, "Master selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:100", input_names },	    //
++			{ "SLZ", nullptr, "Zone 2 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:100", input_names },	    //
++			{ "SL3", nullptr, "Zone 3 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:100", input_names },	    //
++			{ "SL4", nullptr, "Zone 4 selector", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:1;LevelNames:Off;LevelOffHidden:true;LevelActions:100", input_names },	    //
+ 			{ "HDO", nullptr, "HDMI Output", STYPE_Selector, sSwitchTypeSelector, 5, "SelectorStyle:0;LevelNames:Off|Main|Sub|Main+Sub;LevelOffHidden:true;LevelActions:00|01|02|03" }, //
++			{ "NSB", nullptr, "Network standby", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr, "ON", "OFF" },								    //
++			{ "AMT", nullptr, "Master mute", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },										    //
++			{ "ZMT", nullptr, "Zone 2 mute", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },										    //
++			{ "MT3", nullptr, "Zone 3 mute", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },										    //
++			{ "MT4", nullptr, "Zone 4 mute", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },										    //
++			{ "DIM", nullptr, "Front panel dimmer", STYPE_Selector, sSwitchTypeSelector, 0,
++			  "SelectorStyle:1;LevelNames:Bright|Dim|Dark|Shut Off;LevelOffHidden:false;LevelActions:00|01|02|03" },									    //
++			{ "SLP", nullptr, "Sleep timer", STYPE_Selector, sSwitchTypeSelector, 0,
++			  "SelectorStyle:1;LevelNames:Off|15 min|30 min|45 min|60 min|90 min;LevelOffHidden:false;LevelActions:OFF|0F|1E|2D|3C|5A" },							    //
++			{ "MOT", nullptr, "Music Optimizer", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },										    //
++			{ "LTN", nullptr, "Late Night", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },											    //
++			{ "RAS", nullptr, "Cinema Filter / Re-EQ", STYPE_OnOff, sSwitchGeneralSwitch, 0, nullptr, nullptr },									    //
+ 		}																						    //
+ 	};
+ 
+-	constexpr std::array<std::pair<const char *, const char *>, 5> text_types{
++	constexpr std::array<std::pair<const char *, const char *>, 7> text_types{
+ 		{
+ 			{ "NAL", "Album name" },    //
+ 			{ "NAT", "Artist name" },   //
+ 			{ "NTI", "Title name" },    //
+ 			{ "NTM", "Playback time" }, //
+ 			{ "NTR", "Track info" },    //
++			{ "IFA", "Audio format" },  //
++			{ "IFV", "Video format" },  //
+ 		}				    //
+ 	};
+ 
+ #define IS_END_CHAR(x) ((x) == 0x1a)
++
++	// Scale a Domoticz 0-100 dimmer level to/from the receiver's own volume range
++	// (0..volMax, per-zone, reported in the NRI capability XML). volMax<=0 means the
++	// receiver's range for this zone isn't known yet (or the zone genuinely has no volume
++	// control, e.g. this receiver's Zone2 volmax="0") -- pass the value through unscaled
++	// rather than divide by zero.
++	uint8_t ScaleLevelToDevice(uint8_t domoticzLevel, int volMax)
++	{
++		if (volMax <= 0)
++			return domoticzLevel;
++		int raw = (domoticzLevel * volMax + 50) / 100;
++		return static_cast<uint8_t>(std::clamp(raw, 0, volMax));
++	}
++
++	uint8_t ScaleLevelFromDevice(int rawLevel, int volMax)
++	{
++		if (volMax <= 0)
++			return static_cast<uint8_t>(std::clamp(rawLevel, 0, 255));
++		int level = (rawLevel * 100 + volMax / 2) / volMax;
++		return static_cast<uint8_t>(std::clamp(level, 0, 100));
++	}
++
++	// TFR (bass/treble) uses a sign character plus a single hex digit for its two values --
++	// confirmed live: TFRQSTN -> "TFRB00T00" at zero. "00" at zero (no sign), otherwise
++	// "-1".."-A" / "+1".."+A" for the documented -10..+10 range.
++	std::string FormatSignedNibble(int value)
++	{
++		value = std::clamp(value, -10, 10);
++		if (value == 0)
++			return "00";
++		char digit[2];
++		snprintf(digit, sizeof(digit), "%X", std::abs(value));
++		return std::string(value > 0 ? "+" : "-") + digit;
++	}
++
++	int ParseSignedNibble(const char *tok)
++	{
++		if (tok[0] == '0' && tok[1] == '0')
++			return 0;
++		int magnitude = strtol(tok + 1, nullptr, 16);
++		return tok[0] == '-' ? -magnitude : magnitude;
++	}
+ }; // namespace
+ 
+ OnkyoAVTCP::OnkyoAVTCP(const int ID, const std::string &IPAddress, const unsigned short usIPPort)
+@@ -143,6 +230,10 @@ OnkyoAVTCP::OnkyoAVTCP(const int ID, const std::string &IPAddress, const unsigne
+ 	m_retrycntr = RETRY_DELAY;
+ 	m_pPartialPkt = nullptr;
+ 	m_PPktLen = 0;
++	for (int &volMax : m_zoneVolMax)
++		volMax = 0;
++	m_bassLevel = 0;
++	m_trebleLevel = 0;
+ 
+ 	// Ooops, changing Device ID was a mistake. Fix up migration for Main/Z2 power switches from
+ 	// the 3.8153 release. Don't change IDs again!
+@@ -244,6 +335,22 @@ bool OnkyoAVTCP::WriteToHardware(const char *pdata, const unsigned char /*length
+ 	unsigned char packettype = pCmd->ICMND.packettype;
+ 	std::string message;
+ 
++	if (packettype == pTypeSetpoint)
++	{
++		const auto *sp = reinterpret_cast<const _tSetpoint *>(pdata);
++		if (sp->subtype != sTypeSetpoint)
++			return false;
++		int newValue = static_cast<int>(std::lround(sp->value));
++		if (sp->id4 == SP_BASS)
++			m_bassLevel = newValue;
++		else if (sp->id4 == SP_TREBLE)
++			m_trebleLevel = newValue;
++		else
++			return false;
++		std::string cmd = "TFRB" + FormatSignedNibble(m_bassLevel) + "T" + FormatSignedNibble(m_trebleLevel);
++		return SendPacket(cmd.c_str());
++	}
++
+ 	if (packettype == pTypeGeneralSwitch)
+ 	{
+ 		const _tGeneralSwitch *xcmd = reinterpret_cast<const _tGeneralSwitch *>(pdata);
+@@ -276,22 +383,25 @@ bool OnkyoAVTCP::WriteToHardware(const char *pdata, const unsigned char /*length
+ 				}
+ 				else
+ 				{
+-					snprintf(buf, 6, "%s%02X", switch_types[ID].iscpCmd, level);
++					uint8_t sendLevel = level;
++					if (switch_types[ID].switchType == STYPE_Dimmer && ID < 4)
++						sendLevel = ScaleLevelToDevice(static_cast<uint8_t>(level), m_zoneVolMax[ID]);
++					snprintf(buf, 6, "%s%02X", switch_types[ID].iscpCmd, sendLevel);
+ 				}
+ 				SendPacket(buf);
+ 				break;
+ 			case gswitch_sOn:
+ 				if (switch_types[ID].iscpMute)
+-					sprintf(buf, "%s00", switch_types[ID].iscpMute);
++					snprintf(buf, 6, "%s00", switch_types[ID].iscpMute);
+ 				else
+-					sprintf(buf, "%s01", switch_types[ID].iscpCmd);
++					snprintf(buf, sizeof(buf), "%s%s", switch_types[ID].iscpCmd, switch_types[ID].onValue);
+ 				SendPacket(buf);
+ 				break;
+ 			case gswitch_sOff:
+ 				if (switch_types[ID].iscpMute)
+-					sprintf(buf, "%s01", switch_types[ID].iscpMute);
++					snprintf(buf, 6, "%s01", switch_types[ID].iscpMute);
+ 				else
+-					sprintf(buf, "%s00", switch_types[ID].iscpCmd);
++					snprintf(buf, sizeof(buf), "%s%s", switch_types[ID].iscpCmd, switch_types[ID].offValue);
+ 				SendPacket(buf);
+ 				break;
+ 		}
+@@ -306,7 +416,7 @@ bool OnkyoAVTCP::SendPacket(const char *pdata)
+ 		return false;
+ 	}
+ 
+-	Log(LOG_NORM, "Send %s", pdata);
++	Debug(DEBUG_HARDWARE, "Send %s", pdata);
+ 	size_t length = strlen(pdata);
+ 
+ 	struct eiscp_packet *pPkt = (struct eiscp_packet *)malloc(sizeof(*pPkt) + length);
+@@ -342,12 +452,33 @@ bool OnkyoAVTCP::SendPacket(const char *pCmd, const char *pArg)
+ void OnkyoAVTCP::ReceiveSwitchMsg(const char *pData, int Len, bool muting, int ID)
+ {
+ 	char *endp;
+-	int level = strtol(pData + 3, &endp, 16);
++	int level;
+ 	int action = gswitch_sSetLevel;
+ 
++	// A few commands (NSB ON/OFF, SLP's "OFF" state) use literal text tokens instead of a hex
++	// value. 'O' never starts a valid hex byte, so checking for it first can't misparse any
++	// genuine 00-FF value -- it only ever matches these text tokens.
++	if (pData[3] == 'O' && Len >= 6 && pData[4] == 'N')
++	{
++		level = 1;
++		endp = const_cast<char *>(pData) + 5;
++	}
++	else if (pData[3] == 'O' && Len >= 7 && !memcmp(pData + 3, "OFF", 3))
++	{
++		level = 0;
++		endp = const_cast<char *>(pData) + 6;
++	}
++	else
++	{
++		level = strtol(pData + 3, &endp, 16);
++	}
++
+ 	if (!IS_END_CHAR(*endp))
+ 		return;
+ 
++	if (!muting && switch_types[ID].switchType == STYPE_Dimmer && ID < 4)
++		level = ScaleLevelFromDevice(level, m_zoneVolMax[ID]);
++
+ 	if (muting)
+ 		action = level ? gswitch_sOff : gswitch_sOn;
+ 	else if (switch_types[ID].switchType == STYPE_OnOff)
+@@ -382,6 +513,13 @@ void OnkyoAVTCP::ReceiveSwitchMsg(const char *pData, int Len, bool muting, int I
+ 		}
+ 		if (itt2 == strarray.end())
+ 		{
++			// _tGeneralSwitch::level is uint8_t and levels are assigned in steps of 10, so
++			// 26 entries (0..250) is the most this can represent without silently wrapping.
++			if (strarray.size() >= 26)
++			{
++				Log(LOG_ERROR, "Selector '%s' already has the maximum 26 levels; not adding another", switch_types[ID].name);
++				return;
++			}
+ 			// Add previously unknown value to a selector
+ 			std::string str(reinterpret_cast<const char *>(pData + 3), Len - 4);
+ 			std::string level_name = str;
+@@ -433,20 +571,26 @@ void OnkyoAVTCP::EnsureSwitchDevice(int ID, const char *options)
+ {
+ 	std::vector<std::vector<std::string>> result;
+ 	std::string options_str;
+-	result = m_sql.safe_query("SELECT ID FROM DeviceStatus WHERE (HardwareID==%d) AND (DeviceID=='%08X')", m_HwdID, ID);
++	result = m_sql.safe_query("SELECT ID, Options FROM DeviceStatus WHERE (HardwareID==%d) AND (DeviceID=='%08X')", m_HwdID, ID);
+ 	if (result.empty())
+ 	{
+ 		if (!options && switch_types[ID].options)
+ 		{
+ 			options_str = m_sql.FormatDeviceOptions(m_sql.BuildDeviceOptions(switch_types[ID].options, false));
+ 			options = options_str.c_str();
+-			Log(LOG_ERROR, "Options from '%s': '%s'\n", switch_types[ID].options, options);
++			Debug(DEBUG_HARDWARE, "Options from '%s': '%s'", switch_types[ID].options, options);
+ 		}
+ 		m_sql.safe_query("INSERT INTO DeviceStatus (HardwareID, OrgHardwareID, DeviceID, Unit, Type, SubType, SwitchType, Used, SignalLevel, BatteryLevel, Name, nValue, sValue, CustomImage, Options) "
+ 				 "VALUES (%d, %d, '%08X', %d, %d, %d, %d, %d, 12, 255, '%q', 0, '%q', %d, '%q')",
+ 				 m_HwdID, 0, ID, 0, pTypeGeneralSwitch, switch_types[ID].subtype, switch_types[ID].switchType, 1, switch_types[ID].name, "", switch_types[ID].customImage,
+ 				 options ? options : "");
+ 	}
++	else if (options && result[0][1].find("LevelActions:Off|") != std::string::npos)
++	{
++		// Migrate devices created before the Off/0x00 sentinel fix (§3.4): the old
++		// LevelActions placeholder collided with real input 0x00 under hex parsing.
++		m_sql.safe_query("UPDATE DeviceStatus SET Options='%q' WHERE (ID==%s)", options, result[0][0].c_str());
++	}
+ }
+ 
+ std::string OnkyoAVTCP::BuildSelectorOptions(const std::string &names, const std::string &ids)
+@@ -459,6 +603,19 @@ std::string OnkyoAVTCP::BuildSelectorOptions(const std::string &names, const std
+ 	return m_sql.FormatDeviceOptions(optionsMap);
+ }
+ 
++void OnkyoAVTCP::EnsureSetpointOptions(uint8_t id4, const std::string &options)
++{
++	// Must match mainworker's own DeviceID formatting for a _tSetpoint exactly
++	// (main/mainworker.cpp: "%X%02X%02X%02X" of id1..id4) or the lookup below finds nothing.
++	char szID[16];
++	snprintf(szID, sizeof(szID), "%X%02X%02X%02X", 0, 0, 0, id4);
++	std::vector<std::vector<std::string>> result;
++	result = m_sql.safe_query("SELECT ID FROM DeviceStatus WHERE (HardwareID==%d) AND (DeviceID=='%q') AND (Type==%d) AND (SubType==%d)", m_HwdID, szID, pTypeSetpoint, sTypeSetpoint);
++	if (result.empty())
++		return;
++	m_sql.SetDeviceOptions(atoi(result[0][0].c_str()), m_sql.BuildDeviceOptions(options, false));
++}
++
+ bool OnkyoAVTCP::ReceiveXML(const char *pData, int Len)
+ {
+ 	TiXmlDocument doc;
+@@ -512,7 +669,7 @@ bool OnkyoAVTCP::ReceiveXML(const char *pData, int Len)
+ 			if (!escaped_name[0])
+ 				continue;
+ 
+-			for (int i = 0; i < 3; i++)
++			for (int i = 0; i < 4; i++)
+ 			{
+ 				int zone_nr = strtoul(zone, nullptr, 16);
+ 				if (zone_nr & (1 << i))
+@@ -522,7 +679,7 @@ bool OnkyoAVTCP::ReceiveXML(const char *pData, int Len)
+ 					InputNames[i] += '|';
+ 					InputNames[i] += escaped_name;
+ 					if (InputIDs[i].empty())
+-						InputIDs[i] = "Off";
++						InputIDs[i] = SELECTOR_OFF_SENTINEL;
+ 					InputIDs[i] += '|';
+ 					InputIDs[i] += id;
+ 				}
+@@ -552,19 +709,43 @@ bool OnkyoAVTCP::ReceiveXML(const char *pData, int Len)
+ 			if (id < 1 || id > 4)
+ 				continue;
+ 
++			m_zoneVolMax[id - 1] = volmax;
++
+ 			// Create the input selector immediately, with the known options.
+ 			std::string options = BuildSelectorOptions(InputNames[id - 1], InputIDs[id - 1]);
+ 			;
+ 			EnsureSwitchDevice(ID_SLI + id - 1, options.c_str());
+ 
+-			// Send queries for it, and the power and volume for this zone.
++			// A dedicated mute switch per zone, in addition to the existing dimmer-on/off
++			// mute toggle (kept for backward compatibility -- see plan §6 Q7). This also
++			// covers volmax==0 zones (line-level, no volume control at all -- §3.3): their
++			// mute is no longer lost, since it no longer depends on a volume device existing.
++			EnsureSwitchDevice(ID_MUTE_MAIN + id - 1, nullptr);
++
++			// Send queries for it, and the power, volume and mute for this zone.
+ 			SendPacket(switch_types[ID_SLI + id - 1].iscpCmd, "QSTN");
+ 			SendPacket(switch_types[ID_PWR + id - 1].iscpCmd, "QSTN");
+ 			SendPacket(switch_types[ID_MVL + id - 1].iscpCmd, "QSTN");
++			SendPacket(switch_types[ID_MUTE_MAIN + id - 1].iscpCmd, "QSTN");
+ 		}
+ 	}
+ 
++	// Small fixed set of receiver-wide toggles/selectors, not gated on <controllist> (some of
++	// these, e.g. LTN/RAS, answer live despite not being listed there -- §4.8) or on any
++	// per-zone data. Unconditional, matching how the existing selectors/power/volume devices
++	// above are also created unconditionally rather than capability-gated.
++	EnsureSwitchDevice(ID_NSB, nullptr);
++	EnsureSwitchDevice(ID_DIM, nullptr);
++	EnsureSwitchDevice(ID_SLP, nullptr);
++	EnsureSwitchDevice(ID_MOT, nullptr);
++	EnsureSwitchDevice(ID_LTN, nullptr);
++	EnsureSwitchDevice(ID_RAS, nullptr);
++	SendPacket(switch_types[ID_NSB].iscpCmd, "QSTN");
++	for (int id = ID_DIM; id <= ID_RAS; id++)
++		SendPacket(switch_types[id].iscpCmd, "QSTN");
++
+ 	SendPacket("HDOQSTN");
++	SendPacket("TFRQSTN");
+ 	return true;
+ }
+ 
+@@ -582,7 +763,23 @@ void OnkyoAVTCP::ReceiveMessage(const char *pData, int Len)
+ 		ReceiveXML(pData, Len);
+ 		return;
+ 	}
+-	Log(LOG_NORM, "Packet received: %d %.*s", Len, Len - 1, pData);
++	Debug(DEBUG_HARDWARE, "Packet received: %d %.*s", Len, Len - 1, pData);
++
++	// TFR carries bass and treble together in one packet ("TFRB{xx}T{yy}"), which doesn't fit
++	// the single-value-per-command switch_types model -- handle it directly.
++	if (!memcmp(pData, "TFR", 3))
++	{
++		if (Len >= 10 && pData[3] == 'B' && pData[6] == 'T')
++		{
++			m_bassLevel = ParseSignedNibble(pData + 4);
++			m_trebleLevel = ParseSignedNibble(pData + 7);
++			SendSetPointSensor(0, 0, 0, SP_BASS, 1, 255, static_cast<float>(m_bassLevel), "Bass");
++			SendSetPointSensor(0, 0, 0, SP_TREBLE, 1, 255, static_cast<float>(m_trebleLevel), "Treble");
++			EnsureSetpointOptions(SP_BASS, "ValueMin:-10;ValueMax:10;ValueStep:1;ValueUnit:");
++			EnsureSetpointOptions(SP_TREBLE, "ValueMin:-10;ValueMax:10;ValueStep:1;ValueUnit:");
++		}
++		return;
++	}
+ 
+ 	int i = 0;
+ 	for (const auto &text : text_types)
+@@ -596,19 +793,16 @@ void OnkyoAVTCP::ReceiveMessage(const char *pData, int Len)
+ 		++i;
+ 	}
+ 
++	// Don't return on the first match: a mute command (e.g. "AMT01") is relevant both to the
++	// legacy volume device it mutes (as .iscpMute) and to its own dedicated mute switch (as
++	// .iscpCmd) -- both need to see this message.
+ 	i = 0;
+ 	for (const auto &sw : switch_types)
+ 	{
+ 		if (!memcmp(pData, sw.iscpCmd, 3))
+-		{
+ 			ReceiveSwitchMsg(pData, Len, false, i);
+-			return;
+-		}
+-		if (sw.iscpMute && !memcmp(pData, sw.iscpMute, 3))
+-		{
++		else if (sw.iscpMute && !memcmp(pData, sw.iscpMute, 3))
+ 			ReceiveSwitchMsg(pData, Len, true, i);
+-			return;
+-		}
+ 		++i;
+ 	}
+ }
+diff --git a/hardware/OnkyoAVTCP.h b/hardware/OnkyoAVTCP.h
+index 508b49ec1..542f4a9ef 100644
+--- a/hardware/OnkyoAVTCP.h
++++ b/hardware/OnkyoAVTCP.h
+@@ -22,6 +22,7 @@ class OnkyoAVTCP : public CDomoticzHardwareBase, ASyncTCP
+ 	bool ReceiveXML(const char *pData, int Len);
+ 	void EnsureSwitchDevice(int Unit, const char *options = nullptr);
+ 	std::string BuildSelectorOptions(const std::string &names, const std::string &ids);
++	void EnsureSetpointOptions(uint8_t id4, const std::string &options);
+ 	void Do_Work();
+ 
+ 	void OnConnect() override;
+@@ -38,4 +39,13 @@ class OnkyoAVTCP : public CDomoticzHardwareBase, ASyncTCP
+ 	std::string m_szIPAddress;
+ 	unsigned short m_usIPPort;
+ 	std::shared_ptr<std::thread> m_thread;
++	// Per-zone volmax from the receiver's own NRI capability XML, indexed the same as the
++	// volume device IDs (ID_MVL..ID_VL4, i.e. zone id - 1). 0 means "unknown" -> pass raw
++	// values through unscaled rather than divide by zero.
++	int m_zoneVolMax[4];
++	// The TFR command carries bass and treble together in one packet in both directions, but
++	// Domoticz's setpoint devices are written independently -- cache the last-known value of
++	// each so a write to one can be combined with the other's current value.
++	int m_bassLevel;
++	int m_trebleLevel;
+ };
+-- 
+2.51.0
+
