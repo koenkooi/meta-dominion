@@ -46,7 +46,6 @@ CORE_IMAGE_EXTRA_INSTALL += " \
         ethtool \
 	libgpiod-tools \
 	gpsd pps-tools gps-utils chrony setserial \
-	dracut \
 	grow-rootfs \
 "
 
