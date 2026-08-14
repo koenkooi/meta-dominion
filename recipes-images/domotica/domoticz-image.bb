@@ -21,7 +21,7 @@ CORE_IMAGE_EXTRA_INSTALL += " \
 	bash tar wget curl screen rsync procps pigz \
 	openssh-ssh openssh-scp openssh-sftp \
 	net-snmp \
-	e2fsprogs-resize2fs gptfdisk parted findutils coreutils util-linux btrfs-tools \
+	e2fsprogs-resize2fs parted findutils coreutils util-linux btrfs-tools \
 	systemd-networkd iwd \
 	systemd-analyze udev-hwdb \
 	avahi-daemon avahi-utils lldpd iproute2-tc net-tools \
